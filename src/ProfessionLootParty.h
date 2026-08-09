@@ -6,6 +6,10 @@
  * Gives eligible group/raid members an independent profession-loot
  * roll when another member successfully gathers a Mining or Herbalism
  * GameObject.
+ *
+ * Compatible with both:
+ *   - normal AzerothCore gathering
+ *   - mod-auto-gather
  */
 
 #ifndef PROFESSION_LOOT_PARTY_H
@@ -41,7 +45,30 @@ namespace ProfessionLootParty
     void RemovePendingGather(
         ObjectGuid playerGuid);
 
-    void ProcessPendingGather(
+    /*
+     * Returns true when a normal gathering operation was found in the
+     * pending queue. This prevents the auto-gather fallback from
+     * processing the same operation a second time.
+     */
+    bool ProcessPendingGather(
+        Player* gatherer,
+        uint32 skillId);
+
+    /*
+     * Detects mod-auto-gather operations.
+     *
+     * mod-auto-gather does not transition the GameObject through
+     * GO_ACTIVATED. Instead it:
+     *
+     *   1. generates/stores the loot
+     *   2. adds the player to the GameObject skill-up list
+     *   3. calls UpdateGatherSkill()
+     *   4. sets GO_JUST_DEACTIVATED
+     *
+     * Therefore this fallback searches nearby GO_READY resource
+     * nodes which are present in the player's skill-up list.
+     */
+    void ProcessAutoGather(
         Player* gatherer,
         uint32 skillId);
 
@@ -63,12 +90,6 @@ namespace ProfessionLootParty
             Player* player) override;
     };
 
-    /*
-     * IMPORTANT:
-     *
-     * OnGameObjectLootStateChanged() belongs to
-     * AllGameObjectScript in this AzerothCore revision.
-     */
     class GameObjectScript final : public ::AllGameObjectScript
     {
     public:
@@ -90,6 +111,6 @@ namespace ProfessionLootParty
     };
 }
 
-void AddProfessionLootPartyScripts();
+void Addmod_profession_loot_partyScripts();
 
 #endif

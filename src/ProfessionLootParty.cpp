@@ -5,26 +5,22 @@
  *
  * Group profession loot with independent loot rolls.
  *
- * Example:
+ * Supports:
+ *   - Normal AzerothCore Mining/Herbalism gathering
+ *   - mod-auto-gather Mining/Herbalism gathering
  *
- *   Alice - Mining
- *   Bob   - Mining
- *   Carol - Herbalism
- *
- * Alice mines a node:
- *
- *   Alice -> normal AzerothCore loot
- *   Bob   -> independent Mining loot roll
- *   Carol -> nothing
- *
- * Each additional player gets a NEW roll against the same
- * gameobject_loot_template.
+ * The original gatherer keeps their normal loot.
+ * Other eligible group members receive an independent roll.
  */
 
 #include "ProfessionLootParty.h"
 
+#include "CellImpl.h"
 #include "Config.h"
+#include "DBCStores.h"
 #include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Group.h"
 #include "LootMgr.h"
 #include "Log.h"
@@ -33,7 +29,9 @@
 #include "SharedDefines.h"
 #include "Unit.h"
 
+#include <algorithm>
 #include <chrono>
+#include <list>
 #include <unordered_map>
 
 namespace ProfessionLootParty
@@ -51,11 +49,13 @@ namespace ProfessionLootParty
         float MaxDistance = 100.0f;
 
         /*
-         * EffectOpenLock() calls SetLootState() before it calls
-         * UpdateGatherSkill().
+         * Normal AzerothCore gathering:
          *
-         * We temporarily remember the GameObject here, then consume
-         * the record from OnPlayerUpdateGatheringSkill().
+         * EffectOpenLock() changes the GameObject loot state to
+         * GO_ACTIVATED before UpdateGatherSkill() is called.
+         *
+         * We temporarily remember the GameObject and consume it
+         * when the gathering skill update arrives.
          */
         constexpr uint32 PENDING_TIMEOUT_MS = 5000;
 
@@ -75,7 +75,7 @@ namespace ProfessionLootParty
             uint32 now = GetMSTime();
 
             return uint32(now - pending.createdAt) >
-                PENDING_TIMEOUT_MS;
+                   PENDING_TIMEOUT_MS;
         }
 
         void DebugLog(
@@ -160,6 +160,9 @@ namespace ProfessionLootParty
             if (member->GetMapId() != gameObject->GetMapId())
                 return false;
 
+            if (!member->InSamePhase(gameObject))
+                return false;
+
             return member->GetDistance(gameObject) <= MaxDistance;
         }
 
@@ -173,8 +176,8 @@ namespace ProfessionLootParty
                 return false;
 
             /*
-             * The gatherer already receives the normal AzerothCore
-             * gathering loot. Never give the gatherer another roll.
+             * The original gatherer already received their normal
+             * AzerothCore/AutoGather loot.
              */
             if (gatherer->GetGUID() == member->GetGUID())
                 return false;
@@ -232,11 +235,10 @@ namespace ProfessionLootParty
             }
 
             /*
-             * AutoStoreLoot() creates a fresh loot result from the
-             * GameObject loot template.
+             * AutoStoreLoot() creates a completely new loot result
+             * from the same GameObject loot template.
              *
-             * This is intentionally NOT copying the gatherer's loot.
-             * Every eligible recipient gets an independent roll.
+             * This is deliberately NOT a copy of the gatherer's loot.
              */
             player->AutoStoreLoot(
                 lootId,
@@ -247,6 +249,288 @@ namespace ProfessionLootParty
                 "Independent profession loot roll awarded.",
                 player,
                 gameObject);
+        }
+
+        /*
+         * Distribute one successful gathering operation.
+         *
+         * This is shared by:
+         *   - normal AzerothCore gathering
+         *   - mod-auto-gather gathering
+         */
+        void DistributeGatherLoot(
+            Player* gatherer,
+            GameObject* gameObject,
+            uint32 skillId)
+        {
+            if (!gatherer || !gameObject)
+                return;
+
+            if (!IsProfessionEnabled(skillId))
+                return;
+
+            Group* group = gatherer->GetGroup();
+
+            if (!group)
+                return;
+
+            DebugLog(
+                "Confirmed successful profession gathering.",
+                gatherer,
+                gameObject);
+
+            for (GroupReference* groupRef =
+                     group->GetFirstMember();
+                 groupRef != nullptr;
+                 groupRef = groupRef->next())
+            {
+                Player* member =
+                    groupRef->GetSource();
+
+                if (!member)
+                    continue;
+
+                if (!IsEligibleMember(
+                        gatherer,
+                        member,
+                        gameObject,
+                        skillId))
+                {
+                    continue;
+                }
+
+                GiveIndependentRoll(
+                    member,
+                    gameObject);
+            }
+
+            DebugLog(
+                "Profession group loot processing completed.",
+                gatherer,
+                gameObject);
+        }
+
+        /*
+         * Resolve the gathering profession represented by a GameObject.
+         *
+         * This intentionally uses the lock data, exactly like the
+         * auto-gather module does, rather than guessing from the
+         * GameObject entry.
+         */
+        bool IsGatherableNodeForSkill(
+            GameObject* gameObject,
+            Player* player,
+            uint32 skillId)
+        {
+            if (!gameObject || !player)
+                return false;
+
+            if (gameObject->GetGoType() != GAMEOBJECT_TYPE_CHEST)
+                return false;
+
+            GameObjectTemplate const* goInfo =
+                gameObject->GetGOInfo();
+
+            if (!goInfo)
+                return false;
+
+            uint32 lockId = goInfo->GetLockId();
+
+            if (!lockId)
+                return false;
+
+            LockEntry const* lockEntry =
+                sLockStore.LookupEntry(lockId);
+
+            if (!lockEntry)
+                return false;
+
+            for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+            {
+                if (lockEntry->Type[i] != LOCK_KEY_SKILL)
+                    continue;
+
+                uint32 lockType =
+                    lockEntry->Index[i];
+
+                if (lockType != LOCKTYPE_HERBALISM &&
+                    lockType != LOCKTYPE_MINING)
+                {
+                    continue;
+                }
+
+                SkillType resolvedSkill =
+                    SkillByLockType(
+                        LockType(lockType));
+
+                if (resolvedSkill == SKILL_NONE)
+                    continue;
+
+                if (resolvedSkill != skillId)
+                    continue;
+
+                /*
+                 * This is the same skill-level requirement used by
+                 * mod-auto-gather when selecting its nodes.
+                 */
+                if (player->GetSkillValue(resolvedSkill) <
+                    lockEntry->Skill[i])
+                {
+                    continue;
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        /*
+         * Search for the exact GameObject that mod-auto-gather has
+         * just processed.
+         *
+         * The important signal is:
+         *
+         *   GameObject == GO_READY
+         *   +
+         *   player is in GameObject's skill-up list
+         *
+         * mod-auto-gather does this immediately before calling
+         * Player::UpdateGatherSkill().
+         */
+        class AutoGatherNodeCheck
+        {
+        public:
+            AutoGatherNodeCheck(
+                Player* player,
+                uint32 skillId,
+                float range)
+                : _player(player),
+                  _skillId(skillId),
+                  _range(range)
+            {
+            }
+
+            bool operator()(GameObject* gameObject)
+            {
+                if (!gameObject)
+                    return false;
+
+                /*
+                 * AutoGather calls UpdateGatherSkill() before
+                 * SetLootState(GO_JUST_DEACTIVATED), so the node is
+                 * still GO_READY at this exact hook.
+                 */
+                if (gameObject->getLootState() != GO_READY)
+                    return false;
+
+                if (!gameObject->isSpawned())
+                    return false;
+
+                if (!gameObject->IsInMap(_player))
+                    return false;
+
+                if (!gameObject->InSamePhase(_player))
+                    return false;
+
+                if (!_player->IsWithinDist(
+                        gameObject,
+                        _range,
+                        false))
+                {
+                    return false;
+                }
+
+                /*
+                 * This is the critical compatibility check.
+                 *
+                 * AutoGather adds the player to this list immediately
+                 * before UpdateGatherSkill().
+                 */
+                if (!gameObject->IsInSkillupList(
+                        _player->GetGUID()))
+                {
+                    return false;
+                }
+
+                return IsGatherableNodeForSkill(
+                    gameObject,
+                    _player,
+                    _skillId);
+            }
+
+        private:
+            Player* _player;
+            uint32 _skillId;
+            float _range;
+        };
+
+        GameObject* FindAutoGatherNode(
+            Player* player,
+            uint32 skillId)
+        {
+            if (!player)
+                return nullptr;
+
+            if (!player->GetGroup())
+                return nullptr;
+
+            /*
+             * The node must be near the gatherer. We use the module's
+             * configured recipient distance as an upper bound.
+             *
+             * This also supports servers where AutoGather.LootRange
+             * has been increased above its default.
+             */
+            float searchRange = MaxDistance;
+
+            /*
+             * Even when the party distance is configured to zero,
+             * AutoGather still needs a useful search radius to find
+             * the node. One yard is sufficient to avoid an invalid
+             * zero-radius search while still ensuring no recipient
+             * can actually qualify later.
+             */
+            if (searchRange < 1.0f)
+                searchRange = 1.0f;
+
+            std::list<GameObject*> nodes;
+
+            AutoGatherNodeCheck check(
+                player,
+                skillId,
+                searchRange);
+
+            Acore::GameObjectListSearcher<
+                AutoGatherNodeCheck> searcher(
+                    player,
+                    nodes,
+                    check);
+
+            Cell::VisitObjects(
+                player,
+                searcher,
+                searchRange);
+
+            if (nodes.empty())
+                return nullptr;
+
+            /*
+             * Prefer the closest matching node. This protects against
+             * an older skill-up-list entry being present elsewhere in
+             * the same grid.
+             */
+            auto itr = std::min_element(
+                nodes.begin(),
+                nodes.end(),
+                [player](GameObject* left,
+                         GameObject* right)
+                {
+                    return player->GetDistance(left) <
+                           player->GetDistance(right);
+                });
+
+            return itr != nodes.end() ? *itr : nullptr;
         }
     }
 
@@ -311,29 +595,31 @@ namespace ProfessionLootParty
             playerGuid.GetRawValue());
     }
 
-    void ProcessPendingGather(
+    bool ProcessPendingGather(
         Player* gatherer,
         uint32 skillId)
     {
         if (!gatherer)
-            return;
+            return false;
 
         if (!IsGatheringSkill(skillId))
-            return;
+            return false;
 
         auto itr =
             PendingGathers.find(
                 gatherer->GetGUID().GetRawValue());
 
         if (itr == PendingGathers.end())
-            return;
+            return false;
 
         PendingGather pending =
             itr->second;
 
         /*
-         * Consume immediately so this operation can only be processed
-         * once.
+         * Consume immediately.
+         *
+         * This is important because ProcessAutoGather() must NOT
+         * process the same normal gathering operation again.
          */
         PendingGathers.erase(itr);
 
@@ -343,11 +629,11 @@ namespace ProfessionLootParty
                 "Pending gathering operation expired.",
                 gatherer);
 
-            return;
+            return true;
         }
 
         if (!IsProfessionEnabled(skillId))
-            return;
+            return true;
 
         GameObject* gameObject =
             ObjectAccessor::GetGameObject(
@@ -360,20 +646,12 @@ namespace ProfessionLootParty
                 "Pending gathering GameObject no longer exists.",
                 gatherer);
 
-            return;
+            return true;
         }
 
         /*
-         * EffectOpenLock() does:
-         *
-         *   CanOpenLock()
-         *   SendLoot()
-         *   AddToSkillupList()
-         *   UpdateGatherSkill()
-         *
-         * The presence of this GameObject in the gatherer's
-         * skill-up list confirms that this was an actual gathering
-         * operation.
+         * EffectOpenLock() adds the GameObject to the skill-up list
+         * before UpdateGatherSkill().
          */
         if (!gameObject->IsInSkillupList(
                 gatherer->GetGUID()))
@@ -383,55 +661,66 @@ namespace ProfessionLootParty
                 gatherer,
                 gameObject);
 
-            return;
+            return true;
         }
 
-        Group* group =
-            gatherer->GetGroup();
+        DistributeGatherLoot(
+            gatherer,
+            gameObject,
+            skillId);
 
-        if (!group)
+        return true;
+    }
+
+    void ProcessAutoGather(
+        Player* gatherer,
+        uint32 skillId)
+    {
+        if (!gatherer)
+            return;
+
+        if (!IsGatheringSkill(skillId))
+            return;
+
+        if (!IsProfessionEnabled(skillId))
+            return;
+
+        if (!gatherer->GetGroup())
+            return;
+
+        /*
+         * This is intentionally performed only when no normal
+         * GO_ACTIVATED pending operation exists.
+         */
+        GameObject* gameObject =
+            FindAutoGatherNode(
+                gatherer,
+                skillId);
+
+        if (!gameObject)
             return;
 
         DebugLog(
-            "Confirmed successful profession gathering.",
+            "Detected mod-auto-gather operation.",
             gatherer,
             gameObject);
 
-        for (GroupReference* groupRef =
-                 group->GetFirstMember();
-             groupRef != nullptr;
-             groupRef = groupRef->next())
-        {
-            Player* member =
-                groupRef->GetSource();
-
-            if (!member)
-                continue;
-
-            if (!IsEligibleMember(
-                    gatherer,
-                    member,
-                    gameObject,
-                    skillId))
-            {
-                continue;
-            }
-
-            GiveIndependentRoll(
-                member,
-                gameObject);
-        }
-
-        DebugLog(
-            "Profession group loot processing completed.",
+        /*
+         * Do NOT call SetLootState() here.
+         *
+         * mod-auto-gather owns the GameObject lifecycle and will
+         * perform SetLootState(GO_JUST_DEACTIVATED) immediately after
+         * UpdateGatherSkill() returns.
+         */
+        DistributeGatherLoot(
             gatherer,
-            gameObject);
+            gameObject,
+            skillId);
     }
 
     /*
      * PlayerScript
      */
-
     PlayerScript::PlayerScript()
         : ::PlayerScript(
             "ProfessionLootParty_PlayerScript")
@@ -453,7 +742,24 @@ namespace ProfessionLootParty
         if (!IsGatheringSkill(skillId))
             return;
 
-        ProcessPendingGather(
+        /*
+         * First handle normal AzerothCore gathering.
+         *
+         * If this returns true, the operation came through
+         * GO_ACTIVATED and has already been processed.
+         */
+        if (ProcessPendingGather(
+                player,
+                skillId))
+        {
+            return;
+        }
+
+        /*
+         * No normal pending operation means this may be
+         * mod-auto-gather.
+         */
+        ProcessAutoGather(
             player,
             skillId);
     }
@@ -471,10 +777,11 @@ namespace ProfessionLootParty
     /*
      * GameObjectScript
      *
-     * OnGameObjectLootStateChanged() is provided by
-     * AllGameObjectScript in this AzerothCore revision.
+     * Normal AzerothCore gathering reaches GO_ACTIVATED here.
+     *
+     * mod-auto-gather does not use GO_ACTIVATED, which is why the
+     * PlayerScript fallback exists above.
      */
-
     GameObjectScript::GameObjectScript()
         : ::AllGameObjectScript(
             "ProfessionLootParty_GameObjectScript")
@@ -505,21 +812,16 @@ namespace ProfessionLootParty
             return;
 
         /*
-         * There is no reason to track a gather when the player
-         * isn't grouped.
+         * No need to track anything if the player is not grouped.
          */
         if (!gatherer->GetGroup())
             return;
 
         /*
-         * IMPORTANT:
-         *
          * Do not determine Mining vs Herbalism here.
          *
-         * EffectOpenLock() determines the actual SkillType through
-         * CanOpenLock().
-         *
-         * OnPlayerUpdateGatheringSkill() receives that exact skillId.
+         * AzerothCore determines the actual skill and sends it through
+         * OnPlayerUpdateGatheringSkill().
          */
         AddPendingGather(
             gatherer,
@@ -529,7 +831,6 @@ namespace ProfessionLootParty
     /*
      * Configuration
      */
-
     ConfigScript::ConfigScript()
         : ::WorldScript(
             "ProfessionLootParty_ConfigScript")
@@ -606,6 +907,10 @@ namespace ProfessionLootParty
             "server.loading",
             "   Distance: {}",
             MaxDistance);
+
+        LOG_INFO(
+            "server.loading",
+            "   AutoGather compatibility: enabled");
     }
 }
 
