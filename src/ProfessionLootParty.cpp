@@ -612,7 +612,7 @@ namespace ProfessionLootParty
 /*
  * AzerothCore module loader.
  */
-void AddProfessionLootPartyScripts()
+void Addmod_profession_loot_partyScripts()
 {
     new ProfessionLootParty::ConfigScript();
     new ProfessionLootParty::PlayerScript();
