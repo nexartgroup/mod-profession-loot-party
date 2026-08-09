@@ -3,19 +3,16 @@
  *
  * AzerothCore WotLK 3.3.5a
  *
- * When a grouped player successfully gathers a Mining or Herbalism
- * GameObject, eligible group/raid members with the same profession
- * receive their own independent loot roll from the same
- * gameobject_loot_template.
- *
- * The original gatherer continues to receive normal AzerothCore loot.
+ * Gives eligible group/raid members an independent profession-loot
+ * roll when another member successfully gathers a Mining or Herbalism
+ * GameObject.
  */
 
 #ifndef PROFESSION_LOOT_PARTY_H
 #define PROFESSION_LOOT_PARTY_H
 
+#include "AllGameObjectScript.h"
 #include "Define.h"
-#include "GameObjectScript.h"
 #include "ObjectGuid.h"
 #include "PlayerScript.h"
 #include "WorldScript.h"
@@ -37,17 +34,12 @@ namespace ProfessionLootParty
 
     bool IsProfessionEnabled(uint32 skillId);
 
-    bool IsEligibleMember(
-        Player* gatherer,
-        Player* member,
-        GameObject* gameObject,
-        uint32 skillId);
-
     void AddPendingGather(
         Player* gatherer,
         GameObject* gameObject);
 
-    void RemovePendingGather(ObjectGuid playerGuid);
+    void RemovePendingGather(
+        ObjectGuid playerGuid);
 
     void ProcessPendingGather(
         Player* gatherer,
@@ -67,10 +59,17 @@ namespace ProfessionLootParty
             uint32 yellow,
             uint32& gain) override;
 
-        void OnPlayerLogout(Player* player) override;
+        void OnPlayerLogout(
+            Player* player) override;
     };
 
-    class GameObjectScript final : public ::GameObjectScript
+    /*
+     * IMPORTANT:
+     *
+     * OnGameObjectLootStateChanged() belongs to
+     * AllGameObjectScript in this AzerothCore revision.
+     */
+    class GameObjectScript final : public ::AllGameObjectScript
     {
     public:
         GameObjectScript();
@@ -86,8 +85,11 @@ namespace ProfessionLootParty
     public:
         ConfigScript();
 
-        void OnBeforeConfigLoad(bool reload) override;
+        void OnBeforeConfigLoad(
+            bool reload) override;
     };
 }
+
+void AddProfessionLootPartyScripts();
 
 #endif

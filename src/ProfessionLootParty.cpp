@@ -74,7 +74,8 @@ namespace ProfessionLootParty
         {
             uint32 now = GetMSTime();
 
-            return uint32(now - pending.createdAt) > PENDING_TIMEOUT_MS;
+            return uint32(now - pending.createdAt) >
+                PENDING_TIMEOUT_MS;
         }
 
         void DebugLog(
@@ -172,8 +173,8 @@ namespace ProfessionLootParty
                 return false;
 
             /*
-             * The gatherer already received the normal AzerothCore
-             * gathering loot. Never give that player a second roll.
+             * The gatherer already receives the normal AzerothCore
+             * gathering loot. Never give the gatherer another roll.
              */
             if (gatherer->GetGUID() == member->GetGUID())
                 return false;
@@ -196,14 +197,6 @@ namespace ProfessionLootParty
             if (!HasProfession(member, skillId))
                 return false;
 
-            /*
-             * RequireSkill means the recipient must actually possess
-             * the profession.
-             *
-             * We intentionally do not duplicate CanOpenLock() here.
-             * The exact gathering skill has already been determined by
-             * the core for the original gatherer.
-             */
             if (RequireSkill &&
                 member->GetSkillValue(skillId) == 0)
             {
@@ -239,28 +232,11 @@ namespace ProfessionLootParty
             }
 
             /*
-             * IMPORTANT:
+             * AutoStoreLoot() creates a fresh loot result from the
+             * GameObject loot template.
              *
-             * AutoStoreLoot() creates/processes a fresh loot result
-             * from LootTemplates_Gameobject.
-             *
-             * Therefore this is an independent roll, NOT a copy of
-             * the gatherer's LootItem list.
-             *
-             * Example:
-             *
-             *   Node table:
-             *       Ore: 1-3
-             *       Rare item: 10%
-             *
-             *   Player A:
-             *       2 Ore
-             *
-             *   Player B:
-             *       3 Ore + rare item
-             *
-             *   Player C:
-             *       1 Ore
+             * This is intentionally NOT copying the gatherer's loot.
+             * Every eligible recipient gets an independent roll.
              */
             player->AutoStoreLoot(
                 lootId,
@@ -309,9 +285,14 @@ namespace ProfessionLootParty
 
         PendingGather pending;
 
-        pending.gatherer = gatherer->GetGUID();
-        pending.gameObject = gameObject->GetGUID();
-        pending.createdAt = GetMSTime();
+        pending.gatherer =
+            gatherer->GetGUID();
+
+        pending.gameObject =
+            gameObject->GetGUID();
+
+        pending.createdAt =
+            GetMSTime();
 
         PendingGathers[
             gatherer->GetGUID().GetRawValue()
@@ -323,7 +304,8 @@ namespace ProfessionLootParty
             gameObject);
     }
 
-    void RemovePendingGather(ObjectGuid playerGuid)
+    void RemovePendingGather(
+        ObjectGuid playerGuid)
     {
         PendingGathers.erase(
             playerGuid.GetRawValue());
@@ -346,13 +328,12 @@ namespace ProfessionLootParty
         if (itr == PendingGathers.end())
             return;
 
-        PendingGather pending = itr->second;
+        PendingGather pending =
+            itr->second;
 
         /*
-         * Consume the pending operation immediately.
-         *
-         * This prevents a second gathering-skill hook from processing
-         * the same node twice.
+         * Consume immediately so this operation can only be processed
+         * once.
          */
         PendingGathers.erase(itr);
 
@@ -368,9 +349,6 @@ namespace ProfessionLootParty
         if (!IsProfessionEnabled(skillId))
             return;
 
-        /*
-         * The GameObject must still exist.
-         */
         GameObject* gameObject =
             ObjectAccessor::GetGameObject(
                 *gatherer,
@@ -386,33 +364,30 @@ namespace ProfessionLootParty
         }
 
         /*
-         * This is the critical verification.
+         * EffectOpenLock() does:
          *
-         * EffectOpenLock() calls:
-         *
+         *   CanOpenLock()
          *   SendLoot()
          *   AddToSkillupList()
          *   UpdateGatherSkill()
          *
-         * Therefore, when OnPlayerUpdateGatheringSkill() executes,
-         * a genuine successful gathering operation has added this
-         * GameObject to the gatherer's skill-up list.
-         *
-         * A chest activation, door, button, etc. won't pass this
-         * check merely because the player knows Mining/Herbalism.
+         * The presence of this GameObject in the gatherer's
+         * skill-up list confirms that this was an actual gathering
+         * operation.
          */
         if (!gameObject->IsInSkillupList(
                 gatherer->GetGUID()))
         {
             DebugLog(
-                "Gathering skill update did not match the pending GameObject.",
+                "Gathering skill update did not match pending GameObject.",
                 gatherer,
                 gameObject);
 
             return;
         }
 
-        Group* group = gatherer->GetGroup();
+        Group* group =
+            gatherer->GetGroup();
 
         if (!group)
             return;
@@ -422,9 +397,6 @@ namespace ProfessionLootParty
             gatherer,
             gameObject);
 
-        /*
-         * Iterate over every member of the same group/raid.
-         */
         for (GroupReference* groupRef =
                  group->GetFirstMember();
              groupRef != nullptr;
@@ -445,9 +417,6 @@ namespace ProfessionLootParty
                 continue;
             }
 
-            /*
-             * Each member gets a completely independent roll.
-             */
             GiveIndependentRoll(
                 member,
                 gameObject);
@@ -501,10 +470,13 @@ namespace ProfessionLootParty
 
     /*
      * GameObjectScript
+     *
+     * OnGameObjectLootStateChanged() is provided by
+     * AllGameObjectScript in this AzerothCore revision.
      */
 
     GameObjectScript::GameObjectScript()
-        : ::GameObjectScript(
+        : ::AllGameObjectScript(
             "ProfessionLootParty_GameObjectScript")
     {
     }
@@ -533,21 +505,21 @@ namespace ProfessionLootParty
             return;
 
         /*
-         * No group means there is nobody else to reward.
+         * There is no reason to track a gather when the player
+         * isn't grouped.
          */
         if (!gatherer->GetGroup())
             return;
 
         /*
-         * Do NOT determine Mining/Herbalism here.
+         * IMPORTANT:
          *
-         * EffectOpenLock() determines the actual SkillType in:
+         * Do not determine Mining vs Herbalism here.
          *
-         *   CanOpenLock(..., skillId, ...)
+         * EffectOpenLock() determines the actual SkillType through
+         * CanOpenLock().
          *
-         * The skill hook below receives that exact skillId.
-         *
-         * We therefore only remember the GameObject here.
+         * OnPlayerUpdateGatheringSkill() receives that exact skillId.
          */
         AddPendingGather(
             gatherer,
@@ -627,6 +599,11 @@ namespace ProfessionLootParty
 
         LOG_INFO(
             "server.loading",
+            "   RequireSkill: {}",
+            RequireSkill);
+
+        LOG_INFO(
+            "server.loading",
             "   Distance: {}",
             MaxDistance);
     }
@@ -634,8 +611,6 @@ namespace ProfessionLootParty
 
 /*
  * AzerothCore module loader.
- *
- * This is the entry point used by the module CMake integration.
  */
 void AddProfessionLootPartyScripts()
 {
