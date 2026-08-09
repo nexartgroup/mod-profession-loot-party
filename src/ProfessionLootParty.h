@@ -1,79 +1,72 @@
 /*
  * mod-profession-loot-party
  *
- * Allows nearby group/raid members with the appropriate gathering
- * profession to receive their own independent gathering loot roll.
+ * AzerothCore WotLK 3.3.5a
  *
- * Supported:
- *   - Mining
- *   - Herbalism
+ * When a grouped player successfully gathers a Mining or Herbalism
+ * GameObject, eligible group/raid members with the same profession
+ * receive their own independent loot roll from the same
+ * gameobject_loot_template.
  *
- * The original gatherer continues to use AzerothCore's normal loot path.
- * Additional eligible group members receive an independent roll from
- * the same gameobject_loot_template.
+ * The original gatherer continues to receive normal AzerothCore loot.
  */
 
 #ifndef PROFESSION_LOOT_PARTY_H
 #define PROFESSION_LOOT_PARTY_H
 
 #include "Define.h"
+#include "GameObjectScript.h"
 #include "ObjectGuid.h"
 #include "PlayerScript.h"
-#include "GameObjectScript.h"
-
-#include <cstdint>
-#include <unordered_map>
-#include <vector>
+#include "WorldScript.h"
 
 class GameObject;
 class Player;
-class Spell;
+class Unit;
 
 namespace ProfessionLootParty
 {
-    enum class Profession : uint8
-    {
-        None      = 0,
-        Mining    = 1,
-        Herbalism = 2
-    };
-
     struct PendingGather
     {
         ObjectGuid gatherer;
         ObjectGuid gameObject;
-        Profession profession = Profession::None;
         uint32 createdAt = 0;
     };
 
     bool IsEnabled();
-    bool IsProfessionEnabled(Profession profession);
 
-    Profession GetGatheringProfession(Player* player, GameObject* gameObject);
+    bool IsProfessionEnabled(uint32 skillId);
 
     bool IsEligibleMember(
         Player* gatherer,
         Player* member,
         GameObject* gameObject,
-        Profession profession);
-
-    void ProcessPendingGather(Player* gatherer);
+        uint32 skillId);
 
     void AddPendingGather(
         Player* gatherer,
-        GameObject* gameObject,
-        Profession profession);
+        GameObject* gameObject);
 
     void RemovePendingGather(ObjectGuid playerGuid);
 
-    bool HasPendingGather(ObjectGuid playerGuid);
+    void ProcessPendingGather(
+        Player* gatherer,
+        uint32 skillId);
 
     class PlayerScript final : public ::PlayerScript
     {
     public:
         PlayerScript();
 
-        void OnPlayerUpdate(Player* player, uint32 diff) override;
+        void OnPlayerUpdateGatheringSkill(
+            Player* player,
+            uint32 skillId,
+            uint32 currentLevel,
+            uint32 gray,
+            uint32 green,
+            uint32 yellow,
+            uint32& gain) override;
+
         void OnPlayerLogout(Player* player) override;
     };
 
@@ -86,6 +79,14 @@ namespace ProfessionLootParty
             GameObject* gameObject,
             uint32 state,
             Unit* unit) override;
+    };
+
+    class ConfigScript final : public ::WorldScript
+    {
+    public:
+        ConfigScript();
+
+        void OnBeforeConfigLoad(bool reload) override;
     };
 }
 

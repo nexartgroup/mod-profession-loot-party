@@ -28,4 +28,4 @@ ProfessionLootParty.Raid = 1
 ProfessionLootParty.RequireSkill = 1
 
 # Write debug information to the server log.
-ProfessionLootParty.Debug = 0
+ProfessionLootParty.Debug = 1

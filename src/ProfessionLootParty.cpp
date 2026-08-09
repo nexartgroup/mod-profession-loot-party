@@ -1,19 +1,24 @@
 /*
  * mod-profession-loot-party
  *
- * Independent profession gathering loot for group/raid members.
- *
  * AzerothCore WotLK 3.3.5a
  *
- * Mining / Herbalism:
+ * Group profession loot with independent loot rolls.
  *
- *   Player A gathers node
- *        |
- *        +-- A gets normal AzerothCore loot
- *        +-- B gets independent loot roll
- *        +-- C gets independent loot roll
+ * Example:
  *
- * Only group members with the appropriate profession are eligible.
+ *   Alice - Mining
+ *   Bob   - Mining
+ *   Carol - Herbalism
+ *
+ * Alice mines a node:
+ *
+ *   Alice -> normal AzerothCore loot
+ *   Bob   -> independent Mining loot roll
+ *   Carol -> nothing
+ *
+ * Each additional player gets a NEW roll against the same
+ * gameobject_loot_template.
  */
 
 #include "ProfessionLootParty.h"
@@ -23,12 +28,11 @@
 #include "Group.h"
 #include "LootMgr.h"
 #include "Log.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "SharedDefines.h"
 #include "Unit.h"
-#include "World.h"
 
-#include <algorithm>
 #include <chrono>
 #include <unordered_map>
 
@@ -39,13 +43,20 @@ namespace ProfessionLootParty
         bool Enabled = true;
         bool MiningEnabled = true;
         bool HerbalismEnabled = true;
-        bool SkinningEnabled = false;
+
         bool IncludeRaid = true;
         bool RequireSkill = true;
         bool Debug = false;
 
         float MaxDistance = 100.0f;
 
+        /*
+         * EffectOpenLock() calls SetLootState() before it calls
+         * UpdateGatherSkill().
+         *
+         * We temporarily remember the GameObject here, then consume
+         * the record from OnPlayerUpdateGatheringSkill().
+         */
         constexpr uint32 PENDING_TIMEOUT_MS = 5000;
 
         std::unordered_map<uint64, PendingGather> PendingGathers;
@@ -57,6 +68,13 @@ namespace ProfessionLootParty
             return static_cast<uint32>(
                 duration_cast<milliseconds>(
                     steady_clock::now().time_since_epoch()).count());
+        }
+
+        bool IsPendingExpired(PendingGather const& pending)
+        {
+            uint32 now = GetMSTime();
+
+            return uint32(now - pending.createdAt) > PENDING_TIMEOUT_MS;
         }
 
         void DebugLog(
@@ -94,72 +112,20 @@ namespace ProfessionLootParty
             }
         }
 
-        bool IsPendingExpired(PendingGather const& pending)
+        bool IsGatheringSkill(uint32 skillId)
         {
-            uint32 now = GetMSTime();
-
-            return uint32(now - pending.createdAt) > PENDING_TIMEOUT_MS;
+            return skillId == SKILL_MINING ||
+                   skillId == SKILL_HERBALISM;
         }
 
-        bool HasSkillForProfession(
+        bool HasProfession(
             Player* player,
-            Profession profession)
+            uint32 skillId)
         {
             if (!player)
                 return false;
 
-            switch (profession)
-            {
-                case Profession::Mining:
-                    return player->HasSkill(SKILL_MINING);
-
-                case Profession::Herbalism:
-                    return player->HasSkill(SKILL_HERBALISM);
-
-                default:
-                    return false;
-            }
-        }
-
-        bool HasRequiredSkillLevel(
-            Player* player,
-            GameObject* gameObject,
-            Profession profession)
-        {
-            if (!RequireSkill)
-                return true;
-
-            if (!player || !gameObject)
-                return false;
-
-            uint32 skill = 0;
-
-            switch (profession)
-            {
-                case Profession::Mining:
-                    skill = SKILL_MINING;
-                    break;
-
-                case Profession::Herbalism:
-                    skill = SKILL_HERBALISM;
-                    break;
-
-                default:
-                    return false;
-            }
-
-            /*
-             * The exact required skill for a node is evaluated by
-             * Spell::CanOpenLock() in the normal gathering path.
-             *
-             * We deliberately do not try to duplicate the lock table
-             * calculation here. The player must at least possess the
-             * gathering skill.
-             *
-             * The original gatherer has already passed the normal
-             * CanOpenLock() check before this module is reached.
-             */
-            return player->GetSkillValue(skill) > 0;
+            return player->HasSkill(skillId);
         }
 
         bool IsSameGroup(
@@ -184,40 +150,69 @@ namespace ProfessionLootParty
         }
 
         bool IsCloseEnough(
-            Player* gatherer,
             Player* member,
             GameObject* gameObject)
         {
-            if (!gatherer || !member || !gameObject)
+            if (!member || !gameObject)
                 return false;
 
-            if (gatherer->GetMapId() != member->GetMapId())
-                return false;
-
-            if (gameObject->GetMapId() != member->GetMapId())
+            if (member->GetMapId() != gameObject->GetMapId())
                 return false;
 
             return member->GetDistance(gameObject) <= MaxDistance;
         }
 
-        /*
-         * Do not award another roll to the gatherer.
-         *
-         * AzerothCore already created the gatherer's normal loot through
-         * Player::SendLoot() -> Loot::FillLoot().
-         */
-        bool IsGatherer(
+        bool IsEligibleMember(
             Player* gatherer,
-            Player* member)
+            Player* member,
+            GameObject* gameObject,
+            uint32 skillId)
         {
-            return gatherer->GetGUID() == member->GetGUID();
+            if (!gatherer || !member || !gameObject)
+                return false;
+
+            /*
+             * The gatherer already received the normal AzerothCore
+             * gathering loot. Never give that player a second roll.
+             */
+            if (gatherer->GetGUID() == member->GetGUID())
+                return false;
+
+            if (!member->IsInWorld())
+                return false;
+
+            if (!member->IsAlive())
+                return false;
+
+            if (!IsSameGroup(gatherer, member))
+                return false;
+
+            if (!IsCloseEnough(member, gameObject))
+                return false;
+
+            if (!IsProfessionEnabled(skillId))
+                return false;
+
+            if (!HasProfession(member, skillId))
+                return false;
+
+            /*
+             * RequireSkill means the recipient must actually possess
+             * the profession.
+             *
+             * We intentionally do not duplicate CanOpenLock() here.
+             * The exact gathering skill has already been determined by
+             * the core for the original gatherer.
+             */
+            if (RequireSkill &&
+                member->GetSkillValue(skillId) == 0)
+            {
+                return false;
+            }
+
+            return true;
         }
 
-        /*
-         * AutoStoreLoot() uses the actual LootStore and therefore invokes
-         * the normal loot-template processing path. This is intentional:
-         * every recipient receives an independent roll.
-         */
         void GiveIndependentRoll(
             Player* player,
             GameObject* gameObject)
@@ -225,27 +220,52 @@ namespace ProfessionLootParty
             if (!player || !gameObject)
                 return;
 
-            uint32 lootId = gameObject->GetGOInfo()->GetLootId();
+            GameObjectTemplate const* goInfo =
+                gameObject->GetGOInfo();
+
+            if (!goInfo)
+                return;
+
+            uint32 lootId = goInfo->GetLootId();
 
             if (!lootId)
             {
                 DebugLog(
-                    "GameObject has no loot id; skipping independent roll.",
+                    "GameObject has no loot ID; skipping independent roll.",
                     player,
                     gameObject);
+
                 return;
             }
 
             /*
-             * Use the exact same gameobject loot table that AzerothCore
-             * uses for the node.
+             * IMPORTANT:
              *
-             * This generates a NEW Loot object and therefore new chance
-             * and count rolls for this player.
+             * AutoStoreLoot() creates/processes a fresh loot result
+             * from LootTemplates_Gameobject.
+             *
+             * Therefore this is an independent roll, NOT a copy of
+             * the gatherer's LootItem list.
+             *
+             * Example:
+             *
+             *   Node table:
+             *       Ore: 1-3
+             *       Rare item: 10%
+             *
+             *   Player A:
+             *       2 Ore
+             *
+             *   Player B:
+             *       3 Ore + rare item
+             *
+             *   Player C:
+             *       1 Ore
              */
             player->AutoStoreLoot(
                 lootId,
-                LootTemplates_Gameobject);
+                LootTemplates_Gameobject,
+                true);
 
             DebugLog(
                 "Independent profession loot roll awarded.",
@@ -259,98 +279,43 @@ namespace ProfessionLootParty
         return Enabled;
     }
 
-    bool IsProfessionEnabled(Profession profession)
+    bool IsProfessionEnabled(uint32 skillId)
     {
-        switch (profession)
+        if (!Enabled)
+            return false;
+
+        switch (skillId)
         {
-            case Profession::Mining:
-                return Enabled && MiningEnabled;
+            case SKILL_MINING:
+                return MiningEnabled;
 
-            case Profession::Herbalism:
-                return Enabled && HerbalismEnabled;
+            case SKILL_HERBALISM:
+                return HerbalismEnabled;
 
-            case Profession::None:
             default:
                 return false;
         }
     }
 
-    Profession GetGatheringProfession(
-        Player* player,
-        GameObject* gameObject)
-    {
-        if (!player || !gameObject)
-            return Profession::None;
-
-        /*
-         * Gathering nodes are opened through SPELL_EFFECT_OPEN_LOCK.
-         * At the point where GameObjectLootStateChanged fires, the
-         * successful gathering operation has been performed.
-         *
-         * We determine the profession from the player's known gathering
-         * skills. The pending operation is only created after the
-         * successful GameObject activation.
-         *
-         * Mining takes precedence only when the player has Mining.
-         * Herbalism is used otherwise.
-         */
-        if (MiningEnabled && player->HasSkill(SKILL_MINING))
-            return Profession::Mining;
-
-        if (HerbalismEnabled && player->HasSkill(SKILL_HERBALISM))
-            return Profession::Herbalism;
-
-        return Profession::None;
-    }
-
-    bool IsEligibleMember(
-        Player* gatherer,
-        Player* member,
-        GameObject* gameObject,
-        Profession profession)
-    {
-        if (!gatherer || !member || !gameObject)
-            return false;
-
-        if (IsGatherer(gatherer, member))
-            return false;
-
-        if (!member->IsInWorld() || !member->IsAlive())
-            return false;
-
-        if (!IsSameGroup(gatherer, member))
-            return false;
-
-        if (!IsCloseEnough(gatherer, member, gameObject))
-            return false;
-
-        if (!IsProfessionEnabled(profession))
-            return false;
-
-        if (!HasSkillForProfession(member, profession))
-            return false;
-
-        if (!HasRequiredSkillLevel(member, gameObject, profession))
-            return false;
-
-        return true;
-    }
-
     void AddPendingGather(
         Player* gatherer,
-        GameObject* gameObject,
-        Profession profession)
+        GameObject* gameObject)
     {
-        if (!gatherer || !gameObject || profession == Profession::None)
+        if (!gatherer || !gameObject)
+            return;
+
+        if (!gatherer->GetGroup())
             return;
 
         PendingGather pending;
+
         pending.gatherer = gatherer->GetGUID();
         pending.gameObject = gameObject->GetGUID();
-        pending.profession = profession;
         pending.createdAt = GetMSTime();
 
-        PendingGathers[gatherer->GetGUID().GetRawValue()] = pending;
+        PendingGathers[
+            gatherer->GetGUID().GetRawValue()
+        ] = pending;
 
         DebugLog(
             "Gathering operation queued.",
@@ -358,28 +323,37 @@ namespace ProfessionLootParty
             gameObject);
     }
 
-    bool HasPendingGather(ObjectGuid playerGuid)
-    {
-        return PendingGathers.find(playerGuid.GetRawValue()) != PendingGathers.end();
-    }
-
     void RemovePendingGather(ObjectGuid playerGuid)
     {
-        PendingGathers.erase(playerGuid.GetRawValue());
+        PendingGathers.erase(
+            playerGuid.GetRawValue());
     }
 
-    void ProcessPendingGather(Player* gatherer)
+    void ProcessPendingGather(
+        Player* gatherer,
+        uint32 skillId)
     {
         if (!gatherer)
             return;
 
-        auto itr = PendingGathers.find(gatherer->GetGUID().GetRawValue());
+        if (!IsGatheringSkill(skillId))
+            return;
+
+        auto itr =
+            PendingGathers.find(
+                gatherer->GetGUID().GetRawValue());
 
         if (itr == PendingGathers.end())
             return;
 
         PendingGather pending = itr->second;
 
+        /*
+         * Consume the pending operation immediately.
+         *
+         * This prevents a second gathering-skill hook from processing
+         * the same node twice.
+         */
         PendingGathers.erase(itr);
 
         if (IsPendingExpired(pending))
@@ -387,55 +361,77 @@ namespace ProfessionLootParty
             DebugLog(
                 "Pending gathering operation expired.",
                 gatherer);
+
             return;
         }
 
+        if (!IsProfessionEnabled(skillId))
+            return;
+
+        /*
+         * The GameObject must still exist.
+         */
         GameObject* gameObject =
-            ObjectAccessor::GetGameObject(*gatherer, pending.gameObject);
+            ObjectAccessor::GetGameObject(
+                *gatherer,
+                pending.gameObject);
 
         if (!gameObject)
         {
             DebugLog(
                 "Pending gathering GameObject no longer exists.",
                 gatherer);
+
             return;
         }
 
         /*
-         * The core adds the successful gatherer to the GameObject's
-         * skill-up list after SendLoot(). Waiting for the next player
-         * update guarantees that a failed lock attempt does not trigger
-         * this module.
+         * This is the critical verification.
+         *
+         * EffectOpenLock() calls:
+         *
+         *   SendLoot()
+         *   AddToSkillupList()
+         *   UpdateGatherSkill()
+         *
+         * Therefore, when OnPlayerUpdateGatheringSkill() executes,
+         * a genuine successful gathering operation has added this
+         * GameObject to the gatherer's skill-up list.
+         *
+         * A chest activation, door, button, etc. won't pass this
+         * check merely because the player knows Mining/Herbalism.
          */
-        if (!gameObject->IsInSkillupList(gatherer->GetGUID()))
+        if (!gameObject->IsInSkillupList(
+                gatherer->GetGUID()))
         {
-            /*
-             * The state change may have occurred for a normal chest or
-             * another non-gathering GameObject. Do not distribute loot.
-             */
             DebugLog(
-                "GameObject activation was not confirmed as a successful gathering operation.",
+                "Gathering skill update did not match the pending GameObject.",
                 gatherer,
                 gameObject);
-            return;
-        }
 
-        if (!gatherer->GetGroup())
-        {
-            DebugLog(
-                "Gatherer has no group; nothing to distribute.",
-                gatherer,
-                gameObject);
             return;
         }
 
         Group* group = gatherer->GetGroup();
 
-        for (GroupReference* itrGroup = group->GetFirstMember();
-             itrGroup != nullptr;
-             itrGroup = itrGroup->next())
+        if (!group)
+            return;
+
+        DebugLog(
+            "Confirmed successful profession gathering.",
+            gatherer,
+            gameObject);
+
+        /*
+         * Iterate over every member of the same group/raid.
+         */
+        for (GroupReference* groupRef =
+                 group->GetFirstMember();
+             groupRef != nullptr;
+             groupRef = groupRef->next())
         {
-            Player* member = itrGroup->GetSource();
+            Player* member =
+                groupRef->GetSource();
 
             if (!member)
                 continue;
@@ -444,46 +440,72 @@ namespace ProfessionLootParty
                     gatherer,
                     member,
                     gameObject,
-                    pending.profession))
+                    skillId))
+            {
                 continue;
+            }
 
-            GiveIndependentRoll(member, gameObject);
+            /*
+             * Each member gets a completely independent roll.
+             */
+            GiveIndependentRoll(
+                member,
+                gameObject);
         }
 
         DebugLog(
-            "Pending gathering operation processed.",
+            "Profession group loot processing completed.",
             gatherer,
             gameObject);
     }
 
+    /*
+     * PlayerScript
+     */
+
     PlayerScript::PlayerScript()
-        : ::PlayerScript("ProfessionLootParty_PlayerScript")
+        : ::PlayerScript(
+            "ProfessionLootParty_PlayerScript")
     {
     }
 
-    void PlayerScript::OnPlayerUpdate(
+    void PlayerScript::OnPlayerUpdateGatheringSkill(
         Player* player,
-        uint32 /*diff*/)
+        uint32 skillId,
+        uint32 /*currentLevel*/,
+        uint32 /*gray*/,
+        uint32 /*green*/,
+        uint32 /*yellow*/,
+        uint32& /*gain*/)
     {
         if (!player || !IsEnabled())
             return;
 
-        if (!HasPendingGather(player->GetGUID()))
+        if (!IsGatheringSkill(skillId))
             return;
 
-        ProcessPendingGather(player);
+        ProcessPendingGather(
+            player,
+            skillId);
     }
 
-    void PlayerScript::OnPlayerLogout(Player* player)
+    void PlayerScript::OnPlayerLogout(
+        Player* player)
     {
         if (!player)
             return;
 
-        RemovePendingGather(player->GetGUID());
+        RemovePendingGather(
+            player->GetGUID());
     }
 
+    /*
+     * GameObjectScript
+     */
+
     GameObjectScript::GameObjectScript()
-        : ::GameObjectScript("ProfessionLootParty_GameObjectScript")
+        : ::GameObjectScript(
+            "ProfessionLootParty_GameObjectScript")
     {
     }
 
@@ -495,130 +517,129 @@ namespace ProfessionLootParty
         if (!IsEnabled())
             return;
 
-        if (!gameObject || !unit || !unit->IsPlayer())
+        if (!gameObject || !unit)
             return;
 
-        /*
-         * EffectOpenLock() ultimately calls SetLootState(GO_ACTIVATED)
-         * from the GameObject loot path.
-         */
+        if (!unit->IsPlayer())
+            return;
+
         if (state != GO_ACTIVATED)
             return;
 
-        Player* gatherer = unit->ToPlayer();
+        Player* gatherer =
+            unit->ToPlayer();
 
         if (!gatherer)
             return;
 
+        /*
+         * No group means there is nobody else to reward.
+         */
         if (!gatherer->GetGroup())
             return;
 
-        Profession profession =
-            GetGatheringProfession(gatherer, gameObject);
-
-        if (profession == Profession::None)
-            return;
-
-        if (!IsProfessionEnabled(profession))
-            return;
-
+        /*
+         * Do NOT determine Mining/Herbalism here.
+         *
+         * EffectOpenLock() determines the actual SkillType in:
+         *
+         *   CanOpenLock(..., skillId, ...)
+         *
+         * The skill hook below receives that exact skillId.
+         *
+         * We therefore only remember the GameObject here.
+         */
         AddPendingGather(
             gatherer,
-            gameObject,
-            profession);
+            gameObject);
     }
 
     /*
-     * Configuration.
+     * Configuration
      */
-    class ConfigScript final : public WorldScript
+
+    ConfigScript::ConfigScript()
+        : ::WorldScript(
+            "ProfessionLootParty_ConfigScript")
     {
-    public:
-        ConfigScript()
-            : WorldScript("ProfessionLootParty_ConfigScript")
-        {
-        }
+    }
 
-        void OnBeforeConfigLoad(bool reload) override
-        {
-            if (reload)
-                return;
-
-            Enabled =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.Enable",
-                    true);
-
-            MiningEnabled =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.Mining",
-                    true);
-
-            HerbalismEnabled =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.Herbalism",
-                    true);
-
-            SkinningEnabled =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.Skinning",
-                    false);
-
-            IncludeRaid =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.Raid",
-                    true);
-
-            RequireSkill =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.RequireSkill",
-                    true);
-
-            MaxDistance =
-                sConfigMgr->GetOption<float>(
-                    "ProfessionLootParty.Distance",
-                    100.0f);
-
-            Debug =
-                sConfigMgr->GetOption<bool>(
-                    "ProfessionLootParty.Debug",
-                    false);
-
-            if (MaxDistance < 0.0f)
-                MaxDistance = 0.0f;
-
-            LOG_INFO(
-                "server.loading",
-                ">> ProfessionLootParty: {}",
-                Enabled ? "Enabled" : "Disabled");
-
-            LOG_INFO(
-                "server.loading",
-                "   Mining: {}, Herbalism: {}, Raid: {}, Distance: {}",
-                MiningEnabled,
-                HerbalismEnabled,
-                IncludeRaid,
-                MaxDistance);
-        }
-    };
-
-    class ProfessionLootPartyModule
+    void ConfigScript::OnBeforeConfigLoad(
+        bool /*reload*/)
     {
-    public:
-        ProfessionLootPartyModule()
-        {
-            new ConfigScript();
-            new PlayerScript();
-            new GameObjectScript();
-        }
-    };
+        Enabled =
+            sConfigMgr->GetOption<bool>(
+                "ProfessionLootParty.Enable",
+                true);
+
+        MiningEnabled =
+            sConfigMgr->GetOption<bool>(
+                "ProfessionLootParty.Mining",
+                true);
+
+        HerbalismEnabled =
+            sConfigMgr->GetOption<bool>(
+                "ProfessionLootParty.Herbalism",
+                true);
+
+        IncludeRaid =
+            sConfigMgr->GetOption<bool>(
+                "ProfessionLootParty.Raid",
+                true);
+
+        RequireSkill =
+            sConfigMgr->GetOption<bool>(
+                "ProfessionLootParty.RequireSkill",
+                true);
+
+        MaxDistance =
+            sConfigMgr->GetOption<float>(
+                "ProfessionLootParty.Distance",
+                100.0f);
+
+        Debug =
+            sConfigMgr->GetOption<bool>(
+                "ProfessionLootParty.Debug",
+                false);
+
+        if (MaxDistance < 0.0f)
+            MaxDistance = 0.0f;
+
+        LOG_INFO(
+            "server.loading",
+            ">> ProfessionLootParty: {}",
+            Enabled ? "Enabled" : "Disabled");
+
+        LOG_INFO(
+            "server.loading",
+            "   Mining: {}",
+            MiningEnabled);
+
+        LOG_INFO(
+            "server.loading",
+            "   Herbalism: {}",
+            HerbalismEnabled);
+
+        LOG_INFO(
+            "server.loading",
+            "   Raid: {}",
+            IncludeRaid);
+
+        LOG_INFO(
+            "server.loading",
+            "   Distance: {}",
+            MaxDistance);
+    }
 }
 
 /*
  * AzerothCore module loader.
+ *
+ * This is the entry point used by the module CMake integration.
  */
 void AddProfessionLootPartyScripts()
 {
+    new ProfessionLootParty::ConfigScript();
     new ProfessionLootParty::PlayerScript();
     new ProfessionLootParty::GameObjectScript();
 }
