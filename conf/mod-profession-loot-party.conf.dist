@@ -15,7 +15,7 @@ ProfessionLootParty.Mining = 1
 ProfessionLootParty.Herbalism = 1
 
 # Enable independent Skinning loot rolls
-ProfessionLootParty.Skinning = 0
+ProfessionLootParty.Skinning = 1
 
 # Maximum distance in yards between the gathering player
 # and an eligible group member.
@@ -28,4 +28,4 @@ ProfessionLootParty.Raid = 1
 ProfessionLootParty.RequireSkill = 1
 
 # Write debug information to the server log.
-ProfessionLootParty.Debug = 1
+ProfessionLootParty.Debug = 0
