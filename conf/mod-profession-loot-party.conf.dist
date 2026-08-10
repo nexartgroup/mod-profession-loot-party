@@ -1,11 +1,26 @@
 #
 # mod-profession-loot-party
-# Independent profession gathering loot for group members
+#
+# Group profession loot with independent profession skill-up attempts.
+#
+# Supported:
+#   - Mining
+#   - Herbalism
+#   - Skinning
+#
+# Compatible with:
+#   - normal AzerothCore gathering
+#   - mod-auto-gather Mining/Herbalism
+#   - mod-auto-gather Skinning
 #
 
 [ProfessionLootParty]
 
-# Enable/disable the module
+# ================================================================
+# General
+# ================================================================
+
+# Enable/disable the module.
 ProfessionLootParty.Enable = 1
 
 
@@ -13,82 +28,166 @@ ProfessionLootParty.Enable = 1
 # Mining
 # ================================================================
 
-# Enable independent Mining loot rolls
+# Enable group Mining distribution.
 ProfessionLootParty.Mining = 1
 
-# TOTAL number of Mining loot rolls per eligible Mining user.
+# TOTAL number of Mining loot rolls per eligible profession user.
 #
-# 0 = no module-generated Mining rolls
-# 1 = current behavior
+# 1 = normal/base roll
 # 2 = two total rolls
 # 3 = three total rolls
+# 4 = four total rolls
 #
-# Example with 3:
+# The actual gatherer already receives the normal AzerothCore/
+# AutoGather roll, so:
 #
-#   Alice mines:
-#       Alice = normal core loot + 2 additional independent rolls
-#       Bob   = 3 independent rolls
-#       Carol = 3 independent rolls
+#   LootMultiplier = 1
+#       Gatherer = normal loot
+#       Other miner = 1 independent roll
 #
-ProfessionLootParty.MiningMultiplier = 1
+#   LootMultiplier = 3
+#       Gatherer = normal loot + 2 additional rolls
+#       Other miner = 3 independent rolls
+#
+ProfessionLootParty.MiningLootMultiplier = 1
+
+# TOTAL number of Mining skill-up ATTEMPTS.
+#
+# These are real Player::UpdateGatherSkill() calls.
+#
+# 1 = normal/base skill-up attempt
+# 2 = base + 1 additional attempt
+# 3 = base + 2 additional attempts
+#
+# The actual gatherer already receives the normal AzerothCore/
+# AutoGather skill-up attempt, so:
+#
+#   SkillMultiplier = 1
+#       Gatherer = normal skill-up attempt
+#       Other miner = 1 simulated attempt
+#
+#   SkillMultiplier = 3
+#       Gatherer = normal attempt + 2 simulated attempts
+#       Other miner = 3 simulated attempts
+#
+# This is independent from MiningLootMultiplier.
+#
+ProfessionLootParty.MiningSkillMultiplier = 1
 
 
 # ================================================================
 # Herbalism
 # ================================================================
 
-# Enable independent Herbalism loot rolls
+# Enable group Herbalism distribution.
 ProfessionLootParty.Herbalism = 1
 
-# TOTAL number of Herbalism loot rolls per eligible Herbalism user.
-#
-# 0 = no module-generated Herbalism rolls
-# 1 = current behavior
-# 2 = two total rolls
-# 3 = three total rolls
-#
-ProfessionLootParty.HerbalismMultiplier = 1
+# TOTAL number of Herbalism loot rolls.
+ProfessionLootParty.HerbalismLootMultiplier = 1
+
+# TOTAL number of Herbalism skill-up attempts.
+ProfessionLootParty.HerbalismSkillMultiplier = 1
 
 
 # ================================================================
 # Skinning
 # ================================================================
 
-# Enable independent Skinning loot rolls
+# Enable group Skinning distribution.
 ProfessionLootParty.Skinning = 1
 
-# TOTAL number of Skinning loot rolls per eligible Skinning user.
-#
-# 0 = no module-generated Skinning rolls
-# 1 = current behavior
-# 2 = two total rolls
-# 3 = three total rolls
+# TOTAL number of Skinning loot rolls.
 #
 # Works with:
 #   - normal AzerothCore Skinning
-#   - mod-auto-gather Skinning
+#   - mod-auto-gather AutoSkinCreature()
 #
-ProfessionLootParty.SkinningMultiplier = 1
+ProfessionLootParty.SkinningLootMultiplier = 1
+
+# TOTAL number of Skinning skill-up attempts.
+#
+# Uses Player::UpdateGatherSkill().
+#
+# For elite creatures the normal Skinning multiplicator is preserved.
+#
+ProfessionLootParty.SkinningSkillMultiplier = 1
+
+
+# ================================================================
+# Examples
+# ================================================================
+
+# Example 1:
+#
+#   2x loot
+#   normal 1x leveling
+#
+# ProfessionLootParty.MiningLootMultiplier = 2
+# ProfessionLootParty.MiningSkillMultiplier = 1
+#
+#
+# Example 2:
+#
+#   4x loot
+#   3x leveling
+#
+# ProfessionLootParty.MiningLootMultiplier = 4
+# ProfessionLootParty.MiningSkillMultiplier = 3
+#
+#
+# If Alice mines:
+#
+#   Alice:
+#       normal loot
+#       + 3 additional loot rolls
+#       normal skill-up attempt
+#       + 2 additional skill-up attempts
+#
+#   Bob (Mining):
+#       4 independent loot rolls
+#       3 skill-up attempts
+#
+#   Carol (no Mining):
+#       nothing
+#
+#
+# Example 3:
+#
+#   Mining:     1x loot / 1x skill
+#   Herbalism:  2x loot / 1x skill
+#   Skinning:   5x loot / 3x skill
+#
+# ProfessionLootParty.MiningLootMultiplier = 1
+# ProfessionLootParty.MiningSkillMultiplier = 1
+#
+# ProfessionLootParty.HerbalismLootMultiplier = 2
+# ProfessionLootParty.HerbalismSkillMultiplier = 1
+#
+# ProfessionLootParty.SkinningLootMultiplier = 5
+# ProfessionLootParty.SkinningSkillMultiplier = 3
 
 
 # ================================================================
 # Group / raid eligibility
 # ================================================================
 
-# Maximum distance in yards between the gathering player/corpse
-# and an eligible group member.
+# Maximum distance in yards between the gathering source and the
+# eligible group member.
 ProfessionLootParty.Distance = 100
 
 # Include raid members.
 ProfessionLootParty.Raid = 1
 
-# Require the receiving player to have the profession.
+# Require the receiving player to actually know the profession.
+#
+# Recommended: 1
+#
 ProfessionLootParty.RequireSkill = 1
 
 
 # ================================================================
-# Debugging
+# Debug
 # ================================================================
 
-# Write debug information to the server log.
+# Write module diagnostics to the server log.
 ProfessionLootParty.Debug = 0
