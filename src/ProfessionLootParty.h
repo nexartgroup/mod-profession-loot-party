@@ -6,22 +6,17 @@
  * Gives eligible group/raid members an independent profession-loot
  * roll when another member successfully gathers a resource.
  *
- * Supports:
- *   - Normal AzerothCore Mining/Herbalism gathering
- *   - mod-auto-gather Mining/Herbalism gathering
+ * Supported professions:
+ *
+ *   - Mining
+ *   - Herbalism
+ *   - Skinning
+ *
+ * Supported gathering implementations:
+ *
+ *   - Normal AzerothCore gathering
+ *   - mod-auto-gather Mining/Herbalism
  *   - mod-auto-gather Skinning
- *
- * Important:
- *
- * Skinning support is specifically designed around the behavior of
- * mod-auto-gather's AutoSkinCreature():
- *
- *   1. SkinLootId is generated/stored.
- *   2. UNIT_FLAG_SKINNABLE is removed.
- *   3. Creature loot is cleared.
- *   4. loot_type is set to LOOT_SKINNING.
- *   5. UNIT_DYNFLAG_LOOTABLE is removed.
- *   6. UpdateGatherSkill(SKILL_SKINNING) is called.
  *
  * The original gatherer/skinner keeps their normal loot.
  * Other eligible group members receive an independent roll.
@@ -50,8 +45,16 @@ namespace ProfessionLootParty
         uint32 createdAt = 0;
     };
 
+    /*
+     * Used to prevent the same skinned corpse from being processed
+     * more than once.
+     *
+     * This is needed because Skinning has no GameObject loot-state
+     * callback equivalent to normal Mining/Herbalism gathering.
+     */
     struct RecentSkinning
     {
+        ObjectGuid gatherer;
         ObjectGuid creature;
         uint32 createdAt = 0;
     };
@@ -61,7 +64,7 @@ namespace ProfessionLootParty
     bool IsProfessionEnabled(uint32 skillId);
 
     /*
-     * Normal AzerothCore GameObject gathering.
+     * Normal Mining/Herbalism gathering.
      */
     void AddPendingGather(
         Player* gatherer,
@@ -70,38 +73,28 @@ namespace ProfessionLootParty
     void RemovePendingGather(
         ObjectGuid playerGuid);
 
-    /*
-     * Returns true when a normal gathering operation was found.
-     *
-     * This prevents the mod-auto-gather fallback from processing
-     * the same normal gathering operation a second time.
-     */
     bool ProcessPendingGather(
         Player* gatherer,
         uint32 skillId);
 
     /*
-     * Existing mod-auto-gather Mining/Herbalism compatibility.
+     * mod-auto-gather Mining/Herbalism compatibility.
      */
     void ProcessAutoGather(
         Player* gatherer,
         uint32 skillId);
 
     /*
-     * mod-auto-gather Skinning compatibility.
+     * Skinning.
      *
-     * This does NOT hook the normal Skinning spell.
+     * Handles both:
      *
-     * It identifies the creature selected by the player after
-     * mod-auto-gather's AutoSkinCreature() has completed the
-     * Skinning operation and before the skill-update hook returns.
+     *   - normal AzerothCore Skinning
+     *   - mod-auto-gather AutoSkinCreature()
      */
-    void ProcessAutoSkinning(
-        Player* gatherer);
+    bool ProcessSkinning(
+        Player* skinner);
 
-    /*
-     * Removes the short-lived Skinning duplicate-protection record.
-     */
     void RemoveRecentSkinning(
         ObjectGuid playerGuid);
 
