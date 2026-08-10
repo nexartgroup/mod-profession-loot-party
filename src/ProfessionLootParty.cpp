@@ -14,9 +14,22 @@
  *   - mod-auto-gather Herbalism
  *   - mod-auto-gather Skinning
  *
- * The original gatherer/skinner keeps their normal loot.
- * Other eligible group members receive a completely independent
- * roll against the same appropriate loot template.
+ * Multiplier semantics:
+ *
+ *   MiningMultiplier = 1
+ *       Gatherer    -> normal core loot
+ *       Other       -> 1 independent roll
+ *
+ *   MiningMultiplier = 3
+ *       Gatherer    -> normal core loot + 2 independent rolls
+ *       Other       -> 3 independent rolls
+ *
+ * The configured multiplier represents the TOTAL number of
+ * profession loot rolls each eligible profession user receives.
+ *
+ * The original AzerothCore/AutoGather operation is never replaced
+ * or modified. Additional rolls are generated independently through
+ * AutoStoreLoot().
  */
 
 #include "ProfessionLootParty.h"
@@ -51,6 +64,23 @@ namespace ProfessionLootParty
         bool HerbalismEnabled = true;
         bool SkinningEnabled = true;
 
+        /*
+         * TOTAL number of rolls per profession user.
+         *
+         * 1 = current behavior
+         * 2 = two total rolls
+         * 3 = three total rolls
+         */
+        uint32 MiningMultiplier = 1;
+        uint32 HerbalismMultiplier = 1;
+        uint32 SkinningMultiplier = 1;
+
+        /*
+         * Safety limit preventing accidental enormous numbers
+         * of loot-generation calls.
+         */
+        constexpr uint32 MAX_PROFESSION_MULTIPLIER = 100;
+
         bool IncludeRaid = true;
         bool RequireSkill = true;
         bool Debug = false;
@@ -62,9 +92,6 @@ namespace ProfessionLootParty
          *
          * EffectOpenLock() changes the GameObject loot state to
          * GO_ACTIVATED before UpdateGatherSkill() is called.
-         *
-         * We temporarily remember the GameObject and consume it
-         * when the gathering skill update arrives.
          */
         constexpr uint32 PENDING_TIMEOUT_MS = 5000;
 
@@ -78,18 +105,6 @@ namespace ProfessionLootParty
 
         std::unordered_map<uint64, PendingGather> PendingGathers;
 
-        /*
-         * Key:
-         *
-         *     skinner GUID
-         *
-         * Value:
-         *
-         *     last creature processed for that skinner
-         *
-         * This protects against the same UpdateGatherSkill event
-         * being observed more than once.
-         */
         std::unordered_map<uint64, RecentSkinning> RecentSkinnings;
 
         uint32 GetMSTime()
@@ -257,8 +272,10 @@ namespace ProfessionLootParty
                 return false;
 
             /*
-             * The original gatherer already received their normal
-             * AzerothCore/AutoGather loot.
+             * The gatherer is handled separately.
+             *
+             * They already received the normal AzerothCore/
+             * AutoGather loot.
              */
             if (gatherer->GetGUID() == member->GetGUID())
                 return false;
@@ -299,7 +316,9 @@ namespace ProfessionLootParty
                 return false;
 
             /*
-             * The actual skinner keeps their normal skinning loot.
+             * The actual skinner is handled separately.
+             *
+             * They already received the normal skinning loot.
              */
             if (skinner->GetGUID() == member->GetGUID())
                 return false;
@@ -332,7 +351,7 @@ namespace ProfessionLootParty
         }
 
         /*
-         * Independent Mining/Herbalism roll.
+         * Generate ONE independent Mining/Herbalism roll.
          */
         void GiveIndependentGatherRoll(
             Player* player,
@@ -361,9 +380,10 @@ namespace ProfessionLootParty
             }
 
             /*
-             * AutoStoreLoot() generates a NEW result from the loot
-             * template. It does not copy the original gatherer's
-             * loot.
+             * AutoStoreLoot() generates a NEW result from the
+             * GameObject loot template.
+             *
+             * It does not copy the gatherer's loot result.
              */
             player->AutoStoreLoot(
                 lootId,
@@ -377,7 +397,7 @@ namespace ProfessionLootParty
         }
 
         /*
-         * Independent Skinning roll.
+         * Generate ONE independent Skinning roll.
          */
         void GiveIndependentSkinningRoll(
             Player* player,
@@ -418,11 +438,7 @@ namespace ProfessionLootParty
             }
 
             /*
-             * This is deliberately independent from the original
-             * skinner's loot.
-             *
-             * Every eligible party member gets a fresh roll against
-             * the same skinning loot table.
+             * Every call generates a fresh independent roll.
              */
             player->AutoStoreLoot(
                 lootId,
@@ -437,12 +453,19 @@ namespace ProfessionLootParty
         }
 
         /*
-         * Distribute a successful Mining/Herbalism operation.
+         * Distribute successful Mining/Herbalism.
          *
-         * This is shared by:
+         * The original gatherer's normal loot has already happened.
          *
-         *   - normal AzerothCore gathering
-         *   - mod-auto-gather gathering
+         * Therefore:
+         *
+         *   multiplier = 1
+         *       gatherer -> 0 additional rolls
+         *
+         *   multiplier = 3
+         *       gatherer -> 2 additional rolls
+         *
+         * Other eligible group members receive the FULL multiplier.
          */
         void DistributeGatherLoot(
             Player* gatherer,
@@ -461,11 +484,44 @@ namespace ProfessionLootParty
             if (!group)
                 return;
 
+            uint32 multiplier =
+                GetProfessionMultiplier(skillId);
+
             DebugLog(
                 "Confirmed successful profession gathering.",
                 gatherer,
                 gameObject);
 
+            /*
+             * The gatherer already received one normal roll from
+             * AzerothCore/mod-auto-gather.
+             *
+             * Add multiplier - 1 fresh rolls.
+             */
+            if (multiplier > 1)
+            {
+                uint32 additionalRolls =
+                    multiplier - 1;
+
+                DebugLog(
+                    "Giving gatherer additional profession rolls.",
+                    gatherer,
+                    gameObject);
+
+                for (uint32 roll = 0;
+                     roll < additionalRolls;
+                     ++roll)
+                {
+                    GiveIndependentGatherRoll(
+                        gatherer,
+                        gameObject);
+                }
+            }
+
+            /*
+             * Every other eligible profession user receives the
+             * COMPLETE configured number of independent rolls.
+             */
             for (GroupReference* groupRef =
                      group->GetFirstMember();
                  groupRef != nullptr;
@@ -486,9 +542,14 @@ namespace ProfessionLootParty
                     continue;
                 }
 
-                GiveIndependentGatherRoll(
-                    member,
-                    gameObject);
+                for (uint32 roll = 0;
+                     roll < multiplier;
+                     ++roll)
+                {
+                    GiveIndependentGatherRoll(
+                        member,
+                        gameObject);
+                }
             }
 
             DebugLog(
@@ -498,7 +559,20 @@ namespace ProfessionLootParty
         }
 
         /*
-         * Distribute a successful Skinning operation.
+         * Distribute successful Skinning.
+         *
+         * The original skinner already received their normal
+         * skinning loot.
+         *
+         * Therefore:
+         *
+         *   multiplier = 1
+         *       skinner -> normal loot only
+         *
+         *   multiplier = 3
+         *       skinner -> normal loot + 2 independent rolls
+         *
+         * Other eligible skinners receive 3 independent rolls.
          */
         void DistributeSkinningLoot(
             Player* skinner,
@@ -516,12 +590,38 @@ namespace ProfessionLootParty
             if (!group)
                 return;
 
+            uint32 multiplier =
+                GetProfessionMultiplier(SKILL_SKINNING);
+
             DebugLog(
                 "Confirmed successful profession skinning.",
                 skinner,
                 nullptr,
                 creature);
 
+            /*
+             * The original skinner already received their normal
+             * skinning loot.
+             */
+            if (multiplier > 1)
+            {
+                uint32 additionalRolls =
+                    multiplier - 1;
+
+                for (uint32 roll = 0;
+                     roll < additionalRolls;
+                     ++roll)
+                {
+                    GiveIndependentSkinningRoll(
+                        skinner,
+                        creature);
+                }
+            }
+
+            /*
+             * Other eligible Skinning users receive the full
+             * configured multiplier.
+             */
             for (GroupReference* groupRef =
                      group->GetFirstMember();
                  groupRef != nullptr;
@@ -541,9 +641,14 @@ namespace ProfessionLootParty
                     continue;
                 }
 
-                GiveIndependentSkinningRoll(
-                    member,
-                    creature);
+                for (uint32 roll = 0;
+                     roll < multiplier;
+                     ++roll)
+                {
+                    GiveIndependentSkinningRoll(
+                        member,
+                        creature);
+                }
             }
 
             DebugLog(
@@ -554,11 +659,10 @@ namespace ProfessionLootParty
         }
 
         /*
-         * Resolve the gathering profession represented by a
-         * GameObject.
+         * Resolve whether a GameObject is a Mining/Herbalism
+         * gathering node for the specified skill.
          *
-         * This intentionally uses the lock data, matching the
-         * AutoGather implementation rather than guessing from
+         * This follows the lock data rather than guessing from
          * the GameObject entry.
          */
         bool IsGatherableNodeForSkill(
@@ -659,8 +763,8 @@ namespace ProfessionLootParty
                     return false;
 
                 /*
-                 * AutoGather calls UpdateGatherSkill()
-                 * before SetLootState(GO_JUST_DEACTIVATED).
+                 * mod-auto-gather calls UpdateGatherSkill()
+                 * before setting the node to GO_JUST_DEACTIVATED.
                  */
                 if (gameObject->getLootState() !=
                     GO_READY)
@@ -686,9 +790,8 @@ namespace ProfessionLootParty
                 }
 
                 /*
-                 * AutoGather adds the player to the
-                 * skill-up list immediately before
-                 * UpdateGatherSkill().
+                 * AutoGather adds the player to the skill-up list
+                 * immediately before UpdateGatherSkill().
                  */
                 if (!gameObject->IsInSkillupList(
                         _player->GetGUID()))
@@ -769,8 +872,8 @@ namespace ProfessionLootParty
          * Check whether a creature currently represents a
          * successful Skinning operation.
          *
-         * Both normal AzerothCore Skinning and mod-auto-gather
-         * AutoSkinCreature() end up with:
+         * Both normal AzerothCore Skinning and
+         * mod-auto-gather AutoSkinCreature() end up with:
          *
          *   - dead creature
          *   - SkinLootId
@@ -816,10 +919,6 @@ namespace ProfessionLootParty
 
                 /*
                  * Only actual skinning loot states are accepted.
-                 *
-                 * This is the key discriminator between an ordinary
-                 * dead creature and a corpse that has actually been
-                 * skinned.
                  */
                 if (creature->loot.loot_type !=
                     LOOT_SKINNING)
@@ -843,10 +942,10 @@ namespace ProfessionLootParty
                 }
 
                 /*
-                 * A successful skinning operation removes this flag.
+                 * Successful skinning removes this flag.
                  *
-                 * This is true for both normal EffectSkinning()
-                 * and mod-auto-gather's AutoSkinCreature().
+                 * This applies to both normal EffectSkinning()
+                 * and mod-auto-gather AutoSkinCreature().
                  */
                 if (creature->HasUnitFlag(
                         UNIT_FLAG_SKINNABLE))
@@ -855,11 +954,8 @@ namespace ProfessionLootParty
                 }
 
                 /*
-                 * Make sure this is a corpse the player is actually
-                 * entitled to interact with.
-                 *
-                 * This prevents unrelated nearby corpses from being
-                 * selected where possible.
+                 * Restrict the event to a corpse tapped by the
+                 * actual skinner.
                  */
                 if (!creature->isTappedBy(_player))
                     return false;
@@ -909,13 +1005,6 @@ namespace ProfessionLootParty
 
             /*
              * Prefer the closest valid corpse.
-             *
-             * Normal Skinning normally leaves the target corpse
-             * as the nearest valid LOOT_SKINNING creature.
-             *
-             * mod-auto-gather's AutoSkinCreature() likewise leaves
-             * the processed corpse in this state while calling
-             * UpdateGatherSkill().
              */
             auto itr =
                 std::min_element(
@@ -984,9 +1073,6 @@ namespace ProfessionLootParty
             ] = recent;
         }
 
-        /*
-         * Player logout cleanup for Skinning state.
-         */
         void RemoveRecentSkinningInternal(
             ObjectGuid playerGuid)
         {
@@ -1019,6 +1105,28 @@ namespace ProfessionLootParty
 
             default:
                 return false;
+        }
+    }
+
+    uint32 GetProfessionMultiplier(
+        uint32 skillId)
+    {
+        if (!Enabled)
+            return 0;
+
+        switch (skillId)
+        {
+            case SKILL_MINING:
+                return MiningMultiplier;
+
+            case SKILL_HERBALISM:
+                return HerbalismMultiplier;
+
+            case SKILL_SKINNING:
+                return SkinningMultiplier;
+
+            default:
+                return 0;
         }
     }
 
@@ -1089,8 +1197,8 @@ namespace ProfessionLootParty
         /*
          * Consume immediately.
          *
-         * This prevents ProcessAutoGather() from processing the
-         * same operation a second time.
+         * This prevents ProcessAutoGather() from processing
+         * the same operation a second time.
          */
         PendingGathers.erase(itr);
 
@@ -1193,10 +1301,7 @@ namespace ProfessionLootParty
     /*
      * Skinning support.
      *
-     * This deliberately runs independently from the existing
-     * Mining/Herbalism code.
-     *
-     * Normal AzerothCore Skinning:
+     * Normal AzerothCore:
      *
      *   EffectSkinning()
      *       -> LOOT_SKINNING
@@ -1209,7 +1314,7 @@ namespace ProfessionLootParty
      *       -> clears normal corpse loot
      *       -> UpdateGatherSkill(SKILL_SKINNING)
      *
-     * Therefore the same PlayerScript hook can support both.
+     * Therefore the same PlayerScript hook supports both.
      */
     bool ProcessSkinning(
         Player* skinner)
@@ -1229,10 +1334,6 @@ namespace ProfessionLootParty
         if (!skinner->GetGroup())
             return false;
 
-        /*
-         * Search for the corpse which has just transitioned into
-         * the LOOT_SKINNING state.
-         */
         Creature* creature =
             FindSkinningCreature(
                 skinner);
@@ -1247,8 +1348,8 @@ namespace ProfessionLootParty
         }
 
         /*
-         * Prevent duplicate processing of the same corpse for the
-         * same skinner.
+         * Prevent duplicate processing of the same corpse for
+         * the same skinner.
          */
         if (WasSkinningCreatureRecentlyProcessed(
                 skinner,
@@ -1265,9 +1366,6 @@ namespace ProfessionLootParty
 
         /*
          * Mark before distributing.
-         *
-         * This makes the operation effectively one-shot even if
-         * another script causes another skill callback immediately.
          */
         MarkSkinningCreatureProcessed(
             skinner,
@@ -1311,8 +1409,9 @@ namespace ProfessionLootParty
         /*
          * Skinning is deliberately handled separately.
          *
-         * Do not add SKILL_SKINNING to IsGatheringSkill(), because
-         * the Mining/Herbalism AutoGather fallback is GameObject-based.
+         * Do not add SKILL_SKINNING to IsGatheringSkill(),
+         * because Mining/Herbalism AutoGather detection is
+         * GameObject-based.
          */
         if (IsSkinningSkill(skillId))
         {
@@ -1325,9 +1424,6 @@ namespace ProfessionLootParty
 
         /*
          * First handle normal AzerothCore Mining/Herbalism.
-         *
-         * If this returns true, the operation came through
-         * GO_ACTIVATED and has already been processed.
          */
         if (ProcessPendingGather(
                 player,
@@ -1397,9 +1493,6 @@ namespace ProfessionLootParty
         if (!gatherer)
             return;
 
-        /*
-         * No need to track anything if the player is not grouped.
-         */
         if (!gatherer->GetGroup())
             return;
 
@@ -1446,6 +1539,27 @@ namespace ProfessionLootParty
                 "ProfessionLootParty.Skinning",
                 true);
 
+        MiningMultiplier =
+            std::min(
+                sConfigMgr->GetOption<uint32>(
+                    "ProfessionLootParty.MiningMultiplier",
+                    1),
+                MAX_PROFESSION_MULTIPLIER);
+
+        HerbalismMultiplier =
+            std::min(
+                sConfigMgr->GetOption<uint32>(
+                    "ProfessionLootParty.HerbalismMultiplier",
+                    1),
+                MAX_PROFESSION_MULTIPLIER);
+
+        SkinningMultiplier =
+            std::min(
+                sConfigMgr->GetOption<uint32>(
+                    "ProfessionLootParty.SkinningMultiplier",
+                    1),
+                MAX_PROFESSION_MULTIPLIER);
+
         IncludeRaid =
             sConfigMgr->GetOption<bool>(
                 "ProfessionLootParty.Raid",
@@ -1476,18 +1590,21 @@ namespace ProfessionLootParty
 
         LOG_INFO(
             "server.loading",
-            "   Mining: {}",
-            MiningEnabled);
+            "   Mining: {} ({}x)",
+            MiningEnabled,
+            MiningMultiplier);
 
         LOG_INFO(
             "server.loading",
-            "   Herbalism: {}",
-            HerbalismEnabled);
+            "   Herbalism: {} ({}x)",
+            HerbalismEnabled,
+            HerbalismMultiplier);
 
         LOG_INFO(
             "server.loading",
-            "   Skinning: {}",
-            SkinningEnabled);
+            "   Skinning: {} ({}x)",
+            SkinningEnabled,
+            SkinningMultiplier);
 
         LOG_INFO(
             "server.loading",

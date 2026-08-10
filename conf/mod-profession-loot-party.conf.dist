@@ -8,24 +8,87 @@
 # Enable/disable the module
 ProfessionLootParty.Enable = 1
 
+
+# ================================================================
+# Mining
+# ================================================================
+
 # Enable independent Mining loot rolls
 ProfessionLootParty.Mining = 1
+
+# TOTAL number of Mining loot rolls per eligible Mining user.
+#
+# 0 = no module-generated Mining rolls
+# 1 = current behavior
+# 2 = two total rolls
+# 3 = three total rolls
+#
+# Example with 3:
+#
+#   Alice mines:
+#       Alice = normal core loot + 2 additional independent rolls
+#       Bob   = 3 independent rolls
+#       Carol = 3 independent rolls
+#
+ProfessionLootParty.MiningMultiplier = 1
+
+
+# ================================================================
+# Herbalism
+# ================================================================
 
 # Enable independent Herbalism loot rolls
 ProfessionLootParty.Herbalism = 1
 
+# TOTAL number of Herbalism loot rolls per eligible Herbalism user.
+#
+# 0 = no module-generated Herbalism rolls
+# 1 = current behavior
+# 2 = two total rolls
+# 3 = three total rolls
+#
+ProfessionLootParty.HerbalismMultiplier = 1
+
+
+# ================================================================
+# Skinning
+# ================================================================
+
 # Enable independent Skinning loot rolls
 ProfessionLootParty.Skinning = 1
 
-# Maximum distance in yards between the gathering player
+# TOTAL number of Skinning loot rolls per eligible Skinning user.
+#
+# 0 = no module-generated Skinning rolls
+# 1 = current behavior
+# 2 = two total rolls
+# 3 = three total rolls
+#
+# Works with:
+#   - normal AzerothCore Skinning
+#   - mod-auto-gather Skinning
+#
+ProfessionLootParty.SkinningMultiplier = 1
+
+
+# ================================================================
+# Group / raid eligibility
+# ================================================================
+
+# Maximum distance in yards between the gathering player/corpse
 # and an eligible group member.
 ProfessionLootParty.Distance = 100
 
-# Include raid members
+# Include raid members.
 ProfessionLootParty.Raid = 1
 
-# Require the player to have enough skill for the node.
+# Require the receiving player to have the profession.
 ProfessionLootParty.RequireSkill = 1
+
+
+# ================================================================
+# Debugging
+# ================================================================
 
 # Write debug information to the server log.
 ProfessionLootParty.Debug = 0
