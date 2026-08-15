@@ -21,6 +21,7 @@
 # ================================================================
 
 # Enable/disable the module.
+#   Default: 1
 ProfessionLootParty.Enable = 1
 
 
@@ -29,6 +30,7 @@ ProfessionLootParty.Enable = 1
 # ================================================================
 
 # Enable group Mining distribution.
+#   Default: 1
 ProfessionLootParty.Mining = 1
 
 # TOTAL number of Mining loot rolls per eligible profession user.
@@ -36,42 +38,27 @@ ProfessionLootParty.Mining = 1
 # 1 = normal/base roll
 # 2 = two total rolls
 # 3 = three total rolls
-# 4 = four total rolls
 #
 # The actual gatherer already receives the normal AzerothCore/
 # AutoGather roll, so:
 #
 #   LootMultiplier = 1
-#       Gatherer = normal loot
+#       Gatherer    = normal loot
 #       Other miner = 1 independent roll
 #
 #   LootMultiplier = 3
-#       Gatherer = normal loot + 2 additional rolls
+#       Gatherer    = normal loot + 2 additional rolls
 #       Other miner = 3 independent rolls
 #
+#   Range: 1 - 100, Default: 1
 ProfessionLootParty.MiningLootMultiplier = 1
 
 # TOTAL number of Mining skill-up ATTEMPTS.
 #
-# These are real Player::UpdateGatherSkill() calls.
+# These are real Player::UpdateGatherSkill() calls, so a single
+# attempt can still fail. "3x" means three chances, not +3 skill.
 #
-# 1 = normal/base skill-up attempt
-# 2 = base + 1 additional attempt
-# 3 = base + 2 additional attempts
-#
-# The actual gatherer already receives the normal AzerothCore/
-# AutoGather skill-up attempt, so:
-#
-#   SkillMultiplier = 1
-#       Gatherer = normal skill-up attempt
-#       Other miner = 1 simulated attempt
-#
-#   SkillMultiplier = 3
-#       Gatherer = normal attempt + 2 simulated attempts
-#       Other miner = 3 simulated attempts
-#
-# This is independent from MiningLootMultiplier.
-#
+#   Range: 1 - 100, Default: 1
 ProfessionLootParty.MiningSkillMultiplier = 1
 
 
@@ -80,12 +67,15 @@ ProfessionLootParty.MiningSkillMultiplier = 1
 # ================================================================
 
 # Enable group Herbalism distribution.
+#   Default: 1
 ProfessionLootParty.Herbalism = 1
 
 # TOTAL number of Herbalism loot rolls.
+#   Range: 1 - 100, Default: 1
 ProfessionLootParty.HerbalismLootMultiplier = 1
 
 # TOTAL number of Herbalism skill-up attempts.
+#   Range: 1 - 100, Default: 1
 ProfessionLootParty.HerbalismSkillMultiplier = 1
 
 
@@ -94,100 +84,176 @@ ProfessionLootParty.HerbalismSkillMultiplier = 1
 # ================================================================
 
 # Enable group Skinning distribution.
+#   Default: 1
 ProfessionLootParty.Skinning = 1
 
 # TOTAL number of Skinning loot rolls.
 #
-# Works with:
-#   - normal AzerothCore Skinning
-#   - mod-auto-gather AutoSkinCreature()
+# Works with normal AzerothCore Skinning and with
+# mod-auto-gather's AutoSkinCreature().
 #
+#   Range: 1 - 100, Default: 1
 ProfessionLootParty.SkinningLootMultiplier = 1
 
 # TOTAL number of Skinning skill-up attempts.
 #
-# Uses Player::UpdateGatherSkill().
+# The normal elite multiplicator is preserved.
 #
-# For elite creatures the normal Skinning multiplicator is preserved.
-#
+#   Range: 1 - 100, Default: 1
 ProfessionLootParty.SkinningSkillMultiplier = 1
-
-
-# ================================================================
-# Examples
-# ================================================================
-
-# Example 1:
-#
-#   2x loot
-#   normal 1x leveling
-#
-# ProfessionLootParty.MiningLootMultiplier = 2
-# ProfessionLootParty.MiningSkillMultiplier = 1
-#
-#
-# Example 2:
-#
-#   4x loot
-#   3x leveling
-#
-# ProfessionLootParty.MiningLootMultiplier = 4
-# ProfessionLootParty.MiningSkillMultiplier = 3
-#
-#
-# If Alice mines:
-#
-#   Alice:
-#       normal loot
-#       + 3 additional loot rolls
-#       normal skill-up attempt
-#       + 2 additional skill-up attempts
-#
-#   Bob (Mining):
-#       4 independent loot rolls
-#       3 skill-up attempts
-#
-#   Carol (no Mining):
-#       nothing
-#
-#
-# Example 3:
-#
-#   Mining:     1x loot / 1x skill
-#   Herbalism:  2x loot / 1x skill
-#   Skinning:   5x loot / 3x skill
-#
-# ProfessionLootParty.MiningLootMultiplier = 1
-# ProfessionLootParty.MiningSkillMultiplier = 1
-#
-# ProfessionLootParty.HerbalismLootMultiplier = 2
-# ProfessionLootParty.HerbalismSkillMultiplier = 1
-#
-# ProfessionLootParty.SkinningLootMultiplier = 5
-# ProfessionLootParty.SkinningSkillMultiplier = 3
 
 
 # ================================================================
 # Group / raid eligibility
 # ================================================================
 
-# Maximum distance in yards between the gathering source and the
-# eligible group member.
+# Maximum distance in yards between the resource and a group member
+# who should receive loot.
+#
+# Values above the server's visibility distance have no effect,
+# because objects outside that range are not in the grid.
+#
+#   Range: 0 - 250, Default: 100
 ProfessionLootParty.Distance = 100
 
-# Include raid members.
+# Radius in yards used to locate the node or corpse the gatherer
+# just interacted with.
+#
+# This is NOT the group distance. A gatherer always stands directly
+# next to the resource, so a small value is correct and much
+# cheaper: the search is the most expensive operation in the module
+# and its cost grows with the square of this radius.
+#
+# Only raise it if a gathering module teleports or knocks the player
+# away before the skill-up hook fires.
+#
+#   Range: 1 - 100, Default: 10
+ProfessionLootParty.SearchDistance = 10
+
+# Include raid groups.
+#
+# When 0, raid groups are skipped entirely - including the
+# gatherer's own bonus rolls.
+#
+#   Default: 1
 ProfessionLootParty.Raid = 1
 
 # Require the receiving player to actually know the profession.
 #
-# Recommended: 1
+# 0 distributes to every nearby group member regardless of
+# profession. Recommended: 1
 #
+#   Default: 1
 ProfessionLootParty.RequireSkill = 1
 
+# Only act for players who are in a group.
+#
+# Set to 0 to also apply the multipliers to solo gatherers. In that
+# case the module additionally works like a personal gathering
+# multiplier.
+#
+#   Default: 1
+ProfessionLootParty.RequireGroup = 1
+
+# Require the receiving member to meet the node's / creature's own
+# skill requirement.
+#
+# With 0, a member with Mining 1 can receive Titanium Ore from a
+# group mate's node. Recommended: 1
+#
+#   Default: 1
+ProfessionLootParty.RequireNodeSkill = 1
+
+# Maximum number of group members that receive loot from a single
+# gathering operation.
+#
+# Useful in 25/40 man raids to bound the economic impact and the
+# number of loot rolls per node.
+#
+# 0 = unlimited
+#   Default: 0
+ProfessionLootParty.MaxRecipients = 0
+
+# Also apply the multipliers to the player who actually gathered.
+#
+# 0 = only other group members benefit; the gatherer keeps the
+#     unmodified core result.
+#
+#   Default: 1
+ProfessionLootParty.ApplyToGatherer = 1
+
 
 # ================================================================
-# Debug
+# Compatibility
 # ================================================================
+
+# Enable mod-auto-gather detection.
+#
+# When no pending normal gathering operation matches, the module
+# performs a short-range grid search to find the node that
+# mod-auto-gather just processed.
+#
+# Set to 0 if you do not run mod-auto-gather: this removes the
+# search entirely and makes the module cheaper.
+#
+#   Default: 1
+ProfessionLootParty.AutoGatherCompat = 1
+
+
+# ================================================================
+# Feedback
+# ================================================================
+
+# Send a chat message to members who receive profession loot.
+#   Default: 0
+ProfessionLootParty.Announce = 0
 
 # Write module diagnostics to the server log.
+#   Default: 0
 ProfessionLootParty.Debug = 0
+
+
+# ================================================================
+# Examples
+# ================================================================
+
+# Example 1 - 2x loot, normal leveling
+#
+# ProfessionLootParty.MiningLootMultiplier = 2
+# ProfessionLootParty.MiningSkillMultiplier = 1
+#
+#
+# Example 2 - 4x loot, 3x leveling
+#
+# ProfessionLootParty.MiningLootMultiplier = 4
+# ProfessionLootParty.MiningSkillMultiplier = 3
+#
+# If Alice mines:
+#
+#   Alice:  normal loot + 3 additional loot rolls
+#           normal skill-up attempt + 2 additional attempts
+#   Bob:    4 independent loot rolls, 3 skill-up attempts
+#   Carol:  no Mining -> nothing
+#
+#
+# Example 3 - per profession
+#
+# ProfessionLootParty.MiningLootMultiplier     = 1
+# ProfessionLootParty.MiningSkillMultiplier    = 1
+# ProfessionLootParty.HerbalismLootMultiplier  = 2
+# ProfessionLootParty.HerbalismSkillMultiplier = 1
+# ProfessionLootParty.SkinningLootMultiplier   = 5
+# ProfessionLootParty.SkinningSkillMultiplier  = 3
+
+
+# ================================================================
+# Deprecated
+# ================================================================
+
+# The following keys are still read as a fallback for the
+# corresponding *LootMultiplier settings. They never controlled
+# skill-up attempts and should be replaced.
+#
+# ProfessionLootParty.MiningMultiplier
+# ProfessionLootParty.HerbalismMultiplier
+# ProfessionLootParty.SkinningMultiplier

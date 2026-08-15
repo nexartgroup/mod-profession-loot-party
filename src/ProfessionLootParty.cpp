@@ -8,12 +8,8 @@
  * member successfully gathers a resource.
  *
  * Supported:
- *   - Normal AzerothCore Mining
- *   - Normal AzerothCore Herbalism
- *   - Normal AzerothCore Skinning
- *   - mod-auto-gather Mining
- *   - mod-auto-gather Herbalism
- *   - mod-auto-gather Skinning
+ *   - Normal AzerothCore Mining / Herbalism / Skinning
+ *   - mod-auto-gather Mining / Herbalism / Skinning
  *
  * Loot and skill multipliers are independent.
  */
@@ -21,6 +17,7 @@
 #include "ProfessionLootParty.h"
 
 #include "CellImpl.h"
+#include "Chat.h"
 #include "Config.h"
 #include "Creature.h"
 #include "DBCStores.h"
@@ -37,428 +34,408 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <iterator>
 #include <list>
+#include <mutex>
+#include <string>
 #include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 namespace ProfessionLootParty
 {
     namespace
     {
-        bool Enabled = true;
+        /* ==========================================================
+         * Configuration
+         * ========================================================== */
 
-        bool MiningEnabled = true;
-        bool HerbalismEnabled = true;
-        bool SkinningEnabled = true;
-
-        /*
-         * Total loot rolls.
-         *
-         * 1 = normal behavior
-         * 2 = two total loot rolls
-         * 3 = three total loot rolls
-         */
-        uint32 MiningLootMultiplier = 1;
-        uint32 HerbalismLootMultiplier = 1;
-        uint32 SkinningLootMultiplier = 1;
-
-        /*
-         * Total skill-up attempts.
-         *
-         * 1 = normal/base attempt
-         * 2 = base + 1 additional attempt
-         * 3 = base + 2 additional attempts
-         */
-        uint32 MiningSkillMultiplier = 1;
-        uint32 HerbalismSkillMultiplier = 1;
-        uint32 SkinningSkillMultiplier = 1;
+        ModuleSettings g_settings;
 
         constexpr uint32 MAX_PROFESSION_MULTIPLIER = 100;
+        constexpr float  MAX_CONFIG_DISTANCE       = 250.0f;
+        constexpr float  MAX_CONFIG_SEARCH         = 100.0f;
 
-        bool IncludeRaid = true;
-        bool RequireSkill = true;
-        bool Debug = false;
+        /* ==========================================================
+         * Shared runtime state
+         *
+         * AzerothCore updates maps in parallel worker threads
+         * (MapUpdate.Threads > 1), so every container that is shared
+         * between players on different maps must be guarded.
+         * ========================================================== */
 
-        float MaxDistance = 100.0f;
+        struct PendingGatherEntry
+        {
+            ObjectGuid gameObject;
+            uint32     createdAt = 0;
+        };
 
-        constexpr uint32 PENDING_TIMEOUT_MS = 5000;
-        constexpr uint32 SKINNING_RECENT_TIMEOUT_MS = 60000;
+        struct RecentSkinningEntry
+        {
+            ObjectGuid creature;
+            uint32     createdAt = 0;
+        };
 
-        std::unordered_map<uint64, PendingGather> PendingGathers;
-        std::unordered_map<uint64, RecentSkinning> RecentSkinnings;
+        constexpr uint32 PENDING_TIMEOUT_MS          = 5000;
+        constexpr uint32 SKINNING_RECENT_TIMEOUT_MS  = 60000;
+        constexpr uint32 PRUNE_INTERVAL_MS           = 60000;
+        constexpr std::size_t MAX_RECENT_PER_PLAYER  = 8;
+
+        std::mutex g_stateMutex;
+        std::unordered_map<uint64, PendingGatherEntry> g_pendingGathers;
+        std::unordered_map<uint64, std::vector<RecentSkinningEntry>> g_recentSkinnings;
+        uint32 g_lastPruneAt = 0;
 
         /*
-         * UpdateGatherSkill() invokes OnPlayerUpdateGatheringSkill()
-         * itself before doing the actual skill-up roll.
+         * Re-entrancy guard.
          *
-         * Therefore all module-generated UpdateGatherSkill() calls
-         * must be protected from being interpreted as a NEW gathering
-         * operation.
+         * SimulateGatherSkillAttempt() deliberately calls
+         * Player::UpdateGatherSkill(), which fires
+         * OnPlayerUpdateGatheringSkill() again. The nested call must
+         * never be treated as a new gathering operation.
+         *
+         * The simulation is strictly synchronous and never leaves the
+         * calling thread, so a thread-local flag is both correct and
+         * lock free. It replaces the previous shared std::unordered_set,
+         * which was a data race and could leak a stuck entry if
+         * UpdateGatherSkill() ever threw.
          */
-        std::unordered_set<uint64> SimulatedSkillUpdates;
+        thread_local bool t_simulating = false;
 
-        uint32 GetMSTime()
+        class SimulationScope
+        {
+        public:
+            SimulationScope() : _owned(!t_simulating)
+            {
+                if (_owned)
+                    t_simulating = true;
+            }
+
+            ~SimulationScope()
+            {
+                if (_owned)
+                    t_simulating = false;
+            }
+
+            SimulationScope(SimulationScope const&) = delete;
+            SimulationScope& operator=(SimulationScope const&) = delete;
+
+            bool Owned() const { return _owned; }
+
+        private:
+            bool _owned;
+        };
+
+        /* ==========================================================
+         * Small helpers
+         * ========================================================== */
+
+        uint32 NowMS()
         {
             using namespace std::chrono;
 
             return static_cast<uint32>(
-                duration_cast<milliseconds>(
-                    steady_clock::now().time_since_epoch()).count());
+                duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
         }
 
-        bool IsPendingExpired(
-            PendingGather const& pending)
+        bool IsExpired(uint32 createdAt, uint32 timeout)
         {
-            return uint32(GetMSTime() - pending.createdAt) >
-                   PENDING_TIMEOUT_MS;
+            return uint32(NowMS() - createdAt) > timeout;
         }
 
-        bool IsRecentSkinningExpired(
-            RecentSkinning const& recent)
+        void DebugLog(std::string const& message)
         {
-            return uint32(GetMSTime() - recent.createdAt) >
-                   SKINNING_RECENT_TIMEOUT_MS;
-        }
-
-        bool IsSimulatedSkillUpdate(
-            Player* player)
-        {
-            if (!player)
-                return false;
-
-            return SimulatedSkillUpdates.find(
-                       player->GetGUID().GetRawValue()) !=
-                   SimulatedSkillUpdates.end();
-        }
-
-        void DebugLog(
-            char const* message,
-            Player* player = nullptr,
-            GameObject* gameObject = nullptr,
-            Creature* creature = nullptr)
-        {
-            if (!Debug)
+            if (!g_settings.Debug)
                 return;
 
-            if (player && gameObject)
+            LOG_DEBUG("module", "[ProfessionLootParty] {}", message);
+        }
+
+        std::string DescribePlayer(Player* player)
+        {
+            return player ? player->GetName() : std::string("<null>");
+        }
+
+        int8 SlotForSkill(uint32 skillId)
+        {
+            switch (skillId)
             {
-                LOG_DEBUG(
-                    "module",
-                    "[ProfessionLootParty] {} Player={} GO={} Entry={}",
-                    message,
-                    player->GetName(),
-                    gameObject->GetGUID().ToString(),
-                    gameObject->GetEntry());
-
-                return;
+                case SKILL_MINING:    return PROFESSION_MINING;
+                case SKILL_HERBALISM: return PROFESSION_HERBALISM;
+                case SKILL_SKINNING:  return PROFESSION_SKINNING;
+                default:              return -1;
             }
-
-            if (player && creature)
-            {
-                LOG_DEBUG(
-                    "module",
-                    "[ProfessionLootParty] {} Player={} Creature={} Entry={}",
-                    message,
-                    player->GetName(),
-                    creature->GetGUID().ToString(),
-                    creature->GetEntry());
-
-                return;
-            }
-
-            if (player)
-            {
-                LOG_DEBUG(
-                    "module",
-                    "[ProfessionLootParty] {} Player={}",
-                    message,
-                    player->GetName());
-
-                return;
-            }
-
-            LOG_DEBUG(
-                "module",
-                "[ProfessionLootParty] {}",
-                message);
         }
 
-        bool IsGatheringSkill(
-            uint32 skillId)
+        char const* SkillName(uint32 skillId)
         {
-            return skillId == SKILL_MINING ||
-                   skillId == SKILL_HERBALISM;
+            switch (skillId)
+            {
+                case SKILL_MINING:    return "Mining";
+                case SKILL_HERBALISM: return "Herbalism";
+                case SKILL_SKINNING:  return "Skinning";
+                default:              return "Profession";
+            }
         }
 
-        bool IsSkinningSkill(
-            uint32 skillId)
+        ProfessionSettings const* SettingsForSkill(uint32 skillId)
+        {
+            int8 const slot = SlotForSkill(skillId);
+
+            return slot < 0 ? nullptr : &g_settings.Professions[slot];
+        }
+
+        bool IsGatheringSkill(uint32 skillId)
+        {
+            return skillId == SKILL_MINING || skillId == SKILL_HERBALISM;
+        }
+
+        bool IsSkinningSkill(uint32 skillId)
         {
             return skillId == SKILL_SKINNING;
         }
 
-        bool HasProfession(
-            Player* player,
-            uint32 skillId)
+        /* ==========================================================
+         * State bookkeeping
+         * ========================================================== */
+
+        /*
+         * Drops timed-out entries. Called from inside the lock, at
+         * most once per PRUNE_INTERVAL_MS, so nothing accumulates for
+         * players that never complete a queued operation.
+         */
+        void PruneLocked()
         {
-            return player &&
-                   player->HasSkill(skillId);
+            uint32 const now = NowMS();
+
+            if (uint32(now - g_lastPruneAt) < PRUNE_INTERVAL_MS)
+                return;
+
+            g_lastPruneAt = now;
+
+            for (auto itr = g_pendingGathers.begin(); itr != g_pendingGathers.end();)
+                itr = IsExpired(itr->second.createdAt, PENDING_TIMEOUT_MS)
+                    ? g_pendingGathers.erase(itr)
+                    : std::next(itr);
+
+            for (auto itr = g_recentSkinnings.begin(); itr != g_recentSkinnings.end();)
+            {
+                auto& entries = itr->second;
+
+                entries.erase(
+                    std::remove_if(entries.begin(), entries.end(),
+                        [](RecentSkinningEntry const& entry)
+                        {
+                            return IsExpired(entry.createdAt, SKINNING_RECENT_TIMEOUT_MS);
+                        }),
+                    entries.end());
+
+                itr = entries.empty() ? g_recentSkinnings.erase(itr) : std::next(itr);
+            }
         }
 
-        bool IsSameGroup(
-            Player* source,
-            Player* member)
+        bool WasSkinningCreatureRecentlyProcessed(Player* player, Creature* creature)
         {
-            if (!source || !member)
+            if (!player || !creature)
+                return true;
+
+            uint64 const key = player->GetGUID().GetRawValue();
+            ObjectGuid const creatureGuid = creature->GetGUID();
+
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+
+            auto itr = g_recentSkinnings.find(key);
+
+            if (itr == g_recentSkinnings.end())
                 return false;
 
-            Group* group = source->GetGroup();
+            auto& entries = itr->second;
 
-            if (!group)
+            entries.erase(
+                std::remove_if(entries.begin(), entries.end(),
+                    [](RecentSkinningEntry const& entry)
+                    {
+                        return IsExpired(entry.createdAt, SKINNING_RECENT_TIMEOUT_MS);
+                    }),
+                entries.end());
+
+            if (entries.empty())
+            {
+                g_recentSkinnings.erase(itr);
+                return false;
+            }
+
+            return std::any_of(entries.begin(), entries.end(),
+                [&creatureGuid](RecentSkinningEntry const& entry)
+                {
+                    return entry.creature == creatureGuid;
+                });
+        }
+
+        void MarkSkinningCreatureProcessed(Player* player, Creature* creature)
+        {
+            if (!player || !creature)
+                return;
+
+            RecentSkinningEntry entry;
+            entry.creature  = creature->GetGUID();
+            entry.createdAt = NowMS();
+
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+
+            PruneLocked();
+
+            auto& entries = g_recentSkinnings[player->GetGUID().GetRawValue()];
+
+            /*
+             * A ring of the last few corpses instead of a single slot.
+             * With only one slot a player alternating between two
+             * already-skinned corpses could be credited twice.
+             */
+            if (entries.size() >= MAX_RECENT_PER_PLAYER)
+                entries.erase(entries.begin());
+
+            entries.push_back(entry);
+        }
+
+        /* ==========================================================
+         * Eligibility
+         * ========================================================== */
+
+        /*
+         * Instance safe. Comparing only GetMapId() treats two separate
+         * instances of the same map as the same place, which produced
+         * meaningless distances across instance boundaries.
+         */
+        template<typename T>
+        bool IsCloseEnough(Player* member, T* source)
+        {
+            if (!member || !source)
                 return false;
 
-            if (member->GetGroup() != group)
+            if (!member->IsInMap(source))
                 return false;
 
-            if (group->isRaidGroup() && !IncludeRaid)
+            if (!member->InSamePhase(source))
+                return false;
+
+            return member->GetDistance(source) <= g_settings.MaxDistance;
+        }
+
+        bool IsSameGroup(Group* group, Player* member)
+        {
+            return group && member && member->GetGroup() == group;
+        }
+
+        bool HasRequiredProfession(Player* member, uint32 skillId, uint32 requiredSkill)
+        {
+            if (!member)
+                return false;
+
+            /*
+             * RequireSkill = 0 now really means "do not require the
+             * profession". Previously HasSkill() was enforced anyway,
+             * which made the option almost a no-op.
+             */
+            if (!g_settings.RequireSkill)
+                return true;
+
+            if (!member->HasSkill(skillId))
+                return false;
+
+            uint32 const value = member->GetSkillValue(skillId);
+
+            if (!value)
+                return false;
+
+            /*
+             * Without this a member with Mining 1 would receive
+             * Titanium Ore from a group mate's node.
+             */
+            if (g_settings.RequireNodeSkill && requiredSkill && value < requiredSkill)
                 return false;
 
             return true;
         }
 
-        bool IsCloseEnough(
-            Player* member,
-            GameObject* gameObject)
+        template<typename T>
+        bool IsEligibleMember(Player* gatherer, Group* group, Player* member,
+            T* source, uint32 skillId, uint32 requiredSkill)
         {
-            if (!member || !gameObject)
-                return false;
-
-            if (member->GetMapId() != gameObject->GetMapId())
-                return false;
-
-            if (!member->InSamePhase(gameObject))
-                return false;
-
-            return member->GetDistance(gameObject) <= MaxDistance;
-        }
-
-        bool IsCloseEnough(
-            Player* member,
-            Creature* creature)
-        {
-            if (!member || !creature)
-                return false;
-
-            if (member->GetMapId() != creature->GetMapId())
-                return false;
-
-            if (!member->InSamePhase(creature))
-                return false;
-
-            return member->GetDistance(creature) <= MaxDistance;
-        }
-
-        bool IsEligibleGatherMember(
-            Player* gatherer,
-            Player* member,
-            GameObject* gameObject,
-            uint32 skillId)
-        {
-            if (!gatherer || !member || !gameObject)
+            if (!gatherer || !member || !source)
                 return false;
 
             /*
-             * Gatherer is processed separately because the original
-             * AzerothCore/AutoGather operation already gave them one
+             * The gatherer is handled separately: the original
+             * AzerothCore/AutoGather operation already granted one
              * normal loot roll and one normal skill-up attempt.
              */
             if (gatherer->GetGUID() == member->GetGUID())
                 return false;
 
-            if (!member->IsInWorld())
+            if (!member->IsInWorld() || !member->IsAlive())
                 return false;
 
-            if (!member->IsAlive())
+            if (!IsSameGroup(group, member))
                 return false;
 
-            if (!IsSameGroup(gatherer, member))
+            if (!IsCloseEnough(member, source))
                 return false;
 
-            if (!IsCloseEnough(member, gameObject))
+            if (!HasRequiredProfession(member, skillId, requiredSkill))
                 return false;
-
-            if (!IsProfessionEnabled(skillId))
-                return false;
-
-            if (!HasProfession(member, skillId))
-                return false;
-
-            if (RequireSkill &&
-                member->GetSkillValue(skillId) == 0)
-            {
-                return false;
-            }
 
             return true;
         }
 
-        bool IsEligibleSkinningMember(
-            Player* skinner,
-            Player* member,
-            Creature* creature)
-        {
-            if (!skinner || !member || !creature)
-                return false;
-
-            if (skinner->GetGUID() == member->GetGUID())
-                return false;
-
-            if (!member->IsInWorld())
-                return false;
-
-            if (!member->IsAlive())
-                return false;
-
-            if (!IsSameGroup(skinner, member))
-                return false;
-
-            if (!IsCloseEnough(member, creature))
-                return false;
-
-            if (!IsProfessionEnabled(SKILL_SKINNING))
-                return false;
-
-            if (!HasProfession(member, SKILL_SKINNING))
-                return false;
-
-            if (RequireSkill &&
-                member->GetSkillValue(SKILL_SKINNING) == 0)
-            {
-                return false;
-            }
-
-            return true;
-        }
+        /* ==========================================================
+         * Node / creature inspection
+         * ========================================================== */
 
         /*
-         * Return the configured TOTAL loot multiplier.
+         * Resolve the skill requirement encoded in a gathering node's
+         * lock. Pure lookup: it no longer mixes in "can this player
+         * gather it", so the value can also be used to gate receivers.
          */
-        uint32 GetLootMultiplierInternal(
-            uint32 skillId)
-        {
-            switch (skillId)
-            {
-                case SKILL_MINING:
-                    return MiningLootMultiplier;
-
-                case SKILL_HERBALISM:
-                    return HerbalismLootMultiplier;
-
-                case SKILL_SKINNING:
-                    return SkinningLootMultiplier;
-
-                default:
-                    return 1;
-            }
-        }
-
-        /*
-         * Return the configured TOTAL skill-attempt multiplier.
-         */
-        uint32 GetSkillMultiplierInternal(
-            uint32 skillId)
-        {
-            switch (skillId)
-            {
-                case SKILL_MINING:
-                    return MiningSkillMultiplier;
-
-                case SKILL_HERBALISM:
-                    return HerbalismSkillMultiplier;
-
-                case SKILL_SKINNING:
-                    return SkinningSkillMultiplier;
-
-                default:
-                    return 1;
-            }
-        }
-
-        /*
-         * Find the required skill level represented by a Mining/
-         * Herbalism GameObject lock.
-         */
-        bool GetGatheringRequirement(
-            GameObject* gameObject,
-            Player* player,
-            uint32 skillId,
-            uint32& requiredSkill)
+        bool GetNodeSkillRequirement(GameObject* gameObject, uint32 skillId, uint32& requiredSkill)
         {
             requiredSkill = 0;
 
-            if (!gameObject || !player)
+            if (!gameObject || gameObject->GetGoType() != GAMEOBJECT_TYPE_CHEST)
                 return false;
 
-            if (gameObject->GetGoType() !=
-                GAMEOBJECT_TYPE_CHEST)
-            {
-                return false;
-            }
-
-            GameObjectTemplate const* goInfo =
-                gameObject->GetGOInfo();
+            GameObjectTemplate const* goInfo = gameObject->GetGOInfo();
 
             if (!goInfo)
                 return false;
 
-            uint32 lockId = goInfo->GetLockId();
+            uint32 const lockId = goInfo->GetLockId();
 
             if (!lockId)
                 return false;
 
-            LockEntry const* lockEntry =
-                sLockStore.LookupEntry(lockId);
+            LockEntry const* lockEntry = sLockStore.LookupEntry(lockId);
 
             if (!lockEntry)
                 return false;
 
-            for (uint8 i = 0;
-                 i < MAX_LOCK_CASE;
-                 ++i)
+            for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
             {
-                if (lockEntry->Type[i] !=
-                    LOCK_KEY_SKILL)
-                {
-                    continue;
-                }
-
-                uint32 lockType =
-                    lockEntry->Index[i];
-
-                if (lockType != LOCKTYPE_HERBALISM &&
-                    lockType != LOCKTYPE_MINING)
-                {
-                    continue;
-                }
-
-                SkillType resolvedSkill =
-                    SkillByLockType(
-                        LockType(lockType));
-
-                if (resolvedSkill != skillId)
+                if (lockEntry->Type[i] != LOCK_KEY_SKILL)
                     continue;
 
-                requiredSkill =
-                    lockEntry->Skill[i];
+                uint32 const lockType = lockEntry->Index[i];
 
-                /*
-                 * The same check used when identifying an
-                 * AutoGather node.
-                 */
-                if (player->GetSkillValue(resolvedSkill) <
-                    requiredSkill)
-                {
-                    return false;
-                }
+                if (lockType != LOCKTYPE_HERBALISM && lockType != LOCKTYPE_MINING)
+                    continue;
+
+                SkillType const resolvedSkill = SkillByLockType(LockType(lockType));
+
+                /* skillId == 0 means "any gathering node". */
+                if (skillId && resolvedSkill != skillId)
+                    continue;
+
+                requiredSkill = lockEntry->Skill[i];
 
                 return true;
             }
@@ -466,77 +443,33 @@ namespace ProfessionLootParty
             return false;
         }
 
-        bool IsGatherableNodeForSkill(
-            GameObject* gameObject,
-            Player* player,
-            uint32 skillId)
+        bool IsGatheringNode(GameObject* gameObject)
         {
             uint32 requiredSkill = 0;
 
-            return GetGatheringRequirement(
-                gameObject,
-                player,
-                skillId,
-                requiredSkill);
+            return GetNodeSkillRequirement(gameObject, 0, requiredSkill);
         }
 
-        /*
-         * Perform one real AzerothCore gathering skill attempt.
-         *
-         * This intentionally calls Player::UpdateGatherSkill()
-         * instead of manipulating the skill value directly.
-         *
-         * That means:
-         *   - normal server skill-up chance applies
-         *   - skill caps apply
-         *   - server skill gain configuration applies
-         *   - PlayerScript skill hooks apply
-         *   - professions can unlock their normal rewards
-         */
-        bool SimulateGatherSkillAttempt(
-            Player* player,
-            uint32 skillId,
-            uint32 requiredSkill,
-            uint32 multiplicator = 1)
+        bool IsGatherableNodeForSkill(GameObject* gameObject, Player* player, uint32 skillId)
         {
-            if (!player)
+            uint32 requiredSkill = 0;
+
+            if (!GetNodeSkillRequirement(gameObject, skillId, requiredSkill))
                 return false;
 
-            uint32 pureSkillValue =
-                player->GetPureSkillValue(skillId);
-
-            if (!pureSkillValue)
-                return false;
-
-            uint64 playerKey =
-                player->GetGUID().GetRawValue();
-
-            if (!SimulatedSkillUpdates.insert(playerKey).second)
-                return false;
-
-            player->UpdateGatherSkill(
-                skillId,
-                pureSkillValue,
-                requiredSkill,
-                multiplicator);
-
-            SimulatedSkillUpdates.erase(playerKey);
-
-            return true;
+            return player && player->GetSkillValue(skillId) >= requiredSkill;
         }
 
         /*
-         * Skinning requirement matching the AutoGather implementation
-         * supplied for this module.
+         * Skinning requirement, mirroring the core formula used by
+         * Spell::EffectSkinning and mod-auto-gather.
          */
-        uint32 GetSkinningRequirement(
-            Creature* creature)
+        uint32 GetSkinningRequirement(Creature* creature)
         {
             if (!creature)
                 return 0;
 
-            int32 targetLevel =
-                creature->GetLevel();
+            int32 const targetLevel = creature->GetLevel();
 
             if (targetLevel < 10)
                 return 0;
@@ -547,865 +480,682 @@ namespace ProfessionLootParty
             return targetLevel * 5;
         }
 
+        /* ==========================================================
+         * Loot / skill granting
+         * ========================================================== */
+
         /*
-         * One independent Mining/Herbalism loot roll.
+         * One real AzerothCore gathering skill attempt.
+         *
+         * This intentionally calls Player::UpdateGatherSkill() instead
+         * of touching the skill value directly, so normal skill-up
+         * chance, caps, skill gain configuration, script hooks and
+         * profession rewards all keep working.
          */
-        void GiveIndependentGatherLoot(
-            Player* player,
-            GameObject* gameObject)
+        bool SimulateGatherSkillAttempt(Player* player, uint32 skillId,
+            uint32 requiredSkill, uint32 multiplicator = 1)
+        {
+            if (!player)
+                return false;
+
+            uint32 const pureSkillValue = player->GetPureSkillValue(skillId);
+
+            if (!pureSkillValue)
+                return false;
+
+            SimulationScope scope;
+
+            if (!scope.Owned())
+                return false;
+
+            player->UpdateGatherSkill(skillId, pureSkillValue, requiredSkill, multiplicator);
+
+            return true;
+        }
+
+        void GiveIndependentGatherLoot(Player* player, GameObject* gameObject)
         {
             if (!player || !gameObject)
                 return;
 
-            GameObjectTemplate const* goInfo =
-                gameObject->GetGOInfo();
+            GameObjectTemplate const* goInfo = gameObject->GetGOInfo();
 
             if (!goInfo)
                 return;
 
-            uint32 lootId =
-                goInfo->GetLootId();
+            uint32 const lootId = goInfo->GetLootId();
 
             if (!lootId)
                 return;
 
-            player->AutoStoreLoot(
-                lootId,
-                LootTemplates_Gameobject,
-                true);
+            player->AutoStoreLoot(lootId, LootTemplates_Gameobject, true);
         }
 
-        /*
-         * One independent Skinning loot roll.
-         */
-        void GiveIndependentSkinningLoot(
-            Player* player,
-            Creature* creature)
+        void GiveIndependentSkinningLoot(Player* player, Creature* creature)
         {
             if (!player || !creature)
                 return;
 
-            CreatureTemplate const* creatureInfo =
-                creature->GetCreatureTemplate();
+            CreatureTemplate const* creatureInfo = creature->GetCreatureTemplate();
 
             if (!creatureInfo)
                 return;
 
-            uint32 lootId =
-                creatureInfo->SkinLootId;
+            uint32 const lootId = creatureInfo->SkinLootId;
 
-            if (!lootId)
+            if (!lootId || !LootTemplates_Skinning.HaveLootFor(lootId))
                 return;
 
-            if (!LootTemplates_Skinning.HaveLootFor(lootId))
+            player->AutoStoreLoot(lootId, LootTemplates_Skinning, true);
+        }
+
+        void AnnounceToMember(Player* member, Player* gatherer, uint32 skillId)
+        {
+            if (!g_settings.Announce || !member || !gatherer || !member->GetSession())
                 return;
 
-            player->AutoStoreLoot(
-                lootId,
-                LootTemplates_Skinning,
-                true);
+            std::string const message =
+                "|cff33ff99[Profession Loot Party]|r You received " +
+                std::string(SkillName(skillId)) + " loot from " + gatherer->GetName() + ".";
+
+            ChatHandler(member->GetSession()).SendSysMessage(message.c_str());
+        }
+
+        struct RollContext
+        {
+            uint32 skillId         = 0;
+            uint32 requiredSkill   = 0;
+            uint32 lootRolls       = 1;
+            uint32 skillAttempts   = 1;
+            uint32 skillMultiplier = 1;   /* elite skinning modifier */
+        };
+
+        template<typename LootFn>
+        void ApplyRolls(Player* player, RollContext const& ctx,
+            uint32 lootRolls, uint32 skillAttempts, LootFn&& giveLoot)
+        {
+            for (uint32 roll = 0; roll < lootRolls; ++roll)
+                giveLoot(player);
+
+            for (uint32 attempt = 0; attempt < skillAttempts; ++attempt)
+                SimulateGatherSkillAttempt(player, ctx.skillId, ctx.requiredSkill, ctx.skillMultiplier);
         }
 
         /*
-         * Resolve and distribute Mining/Herbalism.
+         * Shared distribution core for nodes and corpses.
          *
-         * Loot:
-         *   Gatherer = lootMultiplier - 1 additional rolls
-         *   Others   = lootMultiplier rolls
-         *
-         * Skill:
-         *   Gatherer = skillMultiplier - 1 additional attempts
-         *   Others   = skillMultiplier attempts
+         * Gatherer : lootRolls - 1 additional rolls, skillAttempts - 1
+         *            additional attempts (the core already gave one of
+         *            each).
+         * Others   : the full configured amounts.
          */
-        void DistributeGatherLoot(
-            Player* gatherer,
-            GameObject* gameObject,
-            uint32 skillId)
+        template<typename SourceT, typename LootFn>
+        uint32 Distribute(Player* gatherer, SourceT* source, RollContext const& ctx, LootFn&& giveLoot)
         {
-            if (!gatherer || !gameObject)
-                return;
+            if (!gatherer || !source)
+                return 0;
 
-            if (!IsProfessionEnabled(skillId))
-                return;
+            if (g_settings.ApplyToGatherer)
+            {
+                ApplyRolls(gatherer, ctx,
+                    ctx.lootRolls > 0 ? ctx.lootRolls - 1 : 0,
+                    ctx.skillAttempts > 0 ? ctx.skillAttempts - 1 : 0,
+                    giveLoot);
+            }
 
-            Group* group =
-                gatherer->GetGroup();
+            Group* group = gatherer->GetGroup();
 
             if (!group)
-                return;
+                return 0;
 
-            uint32 lootMultiplier =
-                GetLootMultiplierInternal(skillId);
+            uint32 recipients = 0;
 
-            uint32 skillMultiplier =
-                GetSkillMultiplierInternal(skillId);
-
-            uint32 requiredSkill = 0;
-
-            /*
-             * If this is a valid gathering operation, the requirement
-             * can be resolved from the node's lock.
-             *
-             * Failure here should not prevent loot distribution.
-             */
-            GetGatheringRequirement(
-                gameObject,
-                gatherer,
-                skillId,
-                requiredSkill);
-
-            /*
-             * The gatherer already received:
-             *
-             *   1 normal loot roll
-             *   1 normal UpdateGatherSkill() attempt
-             *
-             * Only add the configured additional amounts.
-             */
-            for (uint32 roll = 1;
-                 roll < lootMultiplier;
-                 ++roll)
+            for (GroupReference* groupRef = group->GetFirstMember(); groupRef; groupRef = groupRef->next())
             {
-                GiveIndependentGatherLoot(
-                    gatherer,
-                    gameObject);
-            }
+                if (g_settings.MaxRecipients && recipients >= g_settings.MaxRecipients)
+                    break;
 
-            for (uint32 attempt = 1;
-                 attempt < skillMultiplier;
-                 ++attempt)
-            {
-                SimulateGatherSkillAttempt(
-                    gatherer,
-                    skillId,
-                    requiredSkill);
-            }
+                Player* member = groupRef->GetSource();
 
-            /*
-             * Every other group member with the profession receives
-             * the configured TOTAL number of loot rolls and skill
-             * attempts.
-             */
-            for (GroupReference* groupRef =
-                     group->GetFirstMember();
-                 groupRef != nullptr;
-                 groupRef = groupRef->next())
-            {
-                Player* member =
-                    groupRef->GetSource();
-
-                if (!member)
+                if (!IsEligibleMember(gatherer, group, member, source, ctx.skillId, ctx.requiredSkill))
                     continue;
 
-                if (!IsEligibleGatherMember(
-                        gatherer,
-                        member,
-                        gameObject,
-                        skillId))
-                {
-                    continue;
-                }
+                ApplyRolls(member, ctx, ctx.lootRolls, ctx.skillAttempts, giveLoot);
+                AnnounceToMember(member, gatherer, ctx.skillId);
 
-                /*
-                 * Loot.
-                 */
-                for (uint32 roll = 0;
-                     roll < lootMultiplier;
-                     ++roll)
-                {
-                    GiveIndependentGatherLoot(
-                        member,
-                        gameObject);
-                }
-
-                /*
-                 * Skill.
-                 */
-                for (uint32 attempt = 0;
-                     attempt < skillMultiplier;
-                     ++attempt)
-                {
-                    SimulateGatherSkillAttempt(
-                        member,
-                        skillId,
-                        requiredSkill);
-                }
+                ++recipients;
             }
 
-            DebugLog(
-                "Profession group gathering processing completed.",
-                gatherer,
-                gameObject);
+            return recipients;
         }
 
-        /*
-         * Distribute successful Skinning.
+        /* ==========================================================
+         * Cheap pre-checks
          *
-         * The original skinner has already received:
-         *   - normal skinning loot
-         *   - normal UpdateGatherSkill() attempt
-         *
-         * Additional configured amounts are therefore added only
-         * by this module.
-         */
-        void DistributeSkinningLoot(
-            Player* skinner,
-            Creature* creature)
+         * These run before any grid search, which is by far the most
+         * expensive part of the module. With the default 1x/1x setup
+         * and no second group member present, nothing is searched at
+         * all.
+         * ========================================================== */
+
+        bool ShouldProcess(Player* player, uint32 skillId)
         {
-            if (!skinner || !creature)
-                return;
+            if (!g_settings.Enabled || !player)
+                return false;
 
-            if (!IsProfessionEnabled(SKILL_SKINNING))
-                return;
+            ProfessionSettings const* profession = SettingsForSkill(skillId);
 
-            Group* group =
-                skinner->GetGroup();
+            if (!profession || !profession->Enabled)
+                return false;
+
+            Group* group = player->GetGroup();
 
             if (!group)
-                return;
+                return !g_settings.RequireGroup &&
+                       g_settings.ApplyToGatherer &&
+                       (profession->LootMultiplier > 1 || profession->SkillMultiplier > 1);
 
-            uint32 lootMultiplier =
-                GetLootMultiplierInternal(
-                    SKILL_SKINNING);
+            if (group->isRaidGroup() && !g_settings.IncludeRaid)
+                return false;
 
-            uint32 skillMultiplier =
-                GetSkillMultiplierInternal(
-                    SKILL_SKINNING);
+            bool const gathererBonus = g_settings.ApplyToGatherer &&
+                (profession->LootMultiplier > 1 || profession->SkillMultiplier > 1);
 
-            uint32 requiredSkill =
-                GetSkinningRequirement(creature);
+            bool const othersPossible = group->GetMembersCount() > 1;
 
-            uint32 skillMultiplicator =
-                creature->isElite() ? 2 : 1;
-
-            /*
-             * Original skinner:
-             *
-             * normal loot + (lootMultiplier - 1)
-             * normal skill attempt + (skillMultiplier - 1)
-             */
-            for (uint32 roll = 1;
-                 roll < lootMultiplier;
-                 ++roll)
-            {
-                GiveIndependentSkinningLoot(
-                    skinner,
-                    creature);
-            }
-
-            for (uint32 attempt = 1;
-                 attempt < skillMultiplier;
-                 ++attempt)
-            {
-                SimulateGatherSkillAttempt(
-                    skinner,
-                    SKILL_SKINNING,
-                    requiredSkill,
-                    skillMultiplicator);
-            }
-
-            /*
-             * Other Skinning users:
-             *
-             * full configured loot multiplier
-             * full configured skill multiplier
-             */
-            for (GroupReference* groupRef =
-                     group->GetFirstMember();
-                 groupRef != nullptr;
-                 groupRef = groupRef->next())
-            {
-                Player* member =
-                    groupRef->GetSource();
-
-                if (!member)
-                    continue;
-
-                if (!IsEligibleSkinningMember(
-                        skinner,
-                        member,
-                        creature))
-                {
-                    continue;
-                }
-
-                for (uint32 roll = 0;
-                     roll < lootMultiplier;
-                     ++roll)
-                {
-                    GiveIndependentSkinningLoot(
-                        member,
-                        creature);
-                }
-
-                for (uint32 attempt = 0;
-                     attempt < skillMultiplier;
-                     ++attempt)
-                {
-                    SimulateGatherSkillAttempt(
-                        member,
-                        SKILL_SKINNING,
-                        requiredSkill,
-                        skillMultiplicator);
-                }
-            }
-
-            DebugLog(
-                "Profession group skinning processing completed.",
-                skinner,
-                nullptr,
-                creature);
+            return gathererBonus || othersPossible;
         }
 
-        /*
-         * AutoGather Mining/Herbalism node search.
-         */
+        float SearchRadius()
+        {
+            return std::max(1.0f, g_settings.SearchDistance);
+        }
+
+        /* ==========================================================
+         * Distribution entry points
+         * ========================================================== */
+
+        void DistributeGatherLoot(Player* gatherer, GameObject* gameObject, uint32 skillId)
+        {
+            ProfessionSettings const* profession = SettingsForSkill(skillId);
+
+            if (!gatherer || !gameObject || !profession || !profession->Enabled)
+                return;
+
+            RollContext ctx;
+            ctx.skillId       = skillId;
+            ctx.lootRolls     = profession->LootMultiplier;
+            ctx.skillAttempts = profession->SkillMultiplier;
+
+            GetNodeSkillRequirement(gameObject, skillId, ctx.requiredSkill);
+
+            uint32 const recipients = Distribute(gatherer, gameObject, ctx,
+                [gameObject](Player* target) { GiveIndependentGatherLoot(target, gameObject); });
+
+            if (g_settings.Debug)
+            {
+                DebugLog("Gathering distributed. Player=" + DescribePlayer(gatherer) +
+                    " Skill=" + SkillName(skillId) +
+                    " Entry=" + std::to_string(gameObject->GetEntry()) +
+                    " Recipients=" + std::to_string(recipients));
+            }
+        }
+
+        void DistributeSkinningLoot(Player* skinner, Creature* creature)
+        {
+            ProfessionSettings const& profession = g_settings.Professions[PROFESSION_SKINNING];
+
+            if (!skinner || !creature || !profession.Enabled)
+                return;
+
+            RollContext ctx;
+            ctx.skillId         = SKILL_SKINNING;
+            ctx.requiredSkill   = GetSkinningRequirement(creature);
+            ctx.lootRolls       = profession.LootMultiplier;
+            ctx.skillAttempts   = profession.SkillMultiplier;
+            ctx.skillMultiplier = creature->isElite() ? 2 : 1;
+
+            uint32 const recipients = Distribute(skinner, creature, ctx,
+                [creature](Player* target) { GiveIndependentSkinningLoot(target, creature); });
+
+            if (g_settings.Debug)
+            {
+                DebugLog("Skinning distributed. Player=" + DescribePlayer(skinner) +
+                    " Entry=" + std::to_string(creature->GetEntry()) +
+                    " Recipients=" + std::to_string(recipients));
+            }
+        }
+
+        /* ==========================================================
+         * mod-auto-gather detection
+         * ========================================================== */
+
         class AutoGatherNodeCheck
         {
         public:
-            AutoGatherNodeCheck(
-                Player* player,
-                uint32 skillId,
-                float range)
-                : _player(player),
-                  _skillId(skillId),
-                  _range(range)
+            AutoGatherNodeCheck(Player* player, uint32 skillId, float range)
+                : _player(player), _skillId(skillId), _range(range) { }
+
+            bool operator()(GameObject* gameObject)
             {
-            }
-
-            bool operator()(
-                GameObject* gameObject)
-            {
-                if (!gameObject)
+                if (!gameObject || !gameObject->isSpawned())
                     return false;
-
-                if (gameObject->getLootState() !=
-                    GO_READY)
-                {
-                    return false;
-                }
-
-                if (!gameObject->isSpawned())
-                    return false;
-
-                if (!gameObject->IsInMap(_player))
-                    return false;
-
-                if (!gameObject->InSamePhase(_player))
-                    return false;
-
-                if (!_player->IsWithinDist(
-                        gameObject,
-                        _range,
-                        false))
-                {
-                    return false;
-                }
 
                 /*
-                 * mod-auto-gather adds the player to the skill-up
-                 * list immediately before UpdateGatherSkill().
+                 * Accept GO_READY and GO_ACTIVATED: depending on the
+                 * gathering implementation the node may already have
+                 * flipped state when the skill hook fires.
                  */
-                if (!gameObject->IsInSkillupList(
-                        _player->GetGUID()))
-                {
-                    return false;
-                }
+                uint32 const lootState = gameObject->getLootState();
 
-                return IsGatherableNodeForSkill(
-                    gameObject,
-                    _player,
-                    _skillId);
+                if (lootState != GO_READY && lootState != GO_ACTIVATED)
+                    return false;
+
+                if (!gameObject->IsInMap(_player) || !gameObject->InSamePhase(_player))
+                    return false;
+
+                if (!_player->IsWithinDist(gameObject, _range, false))
+                    return false;
+
+                /*
+                 * mod-auto-gather adds the player to the skill-up list
+                 * immediately before UpdateGatherSkill().
+                 */
+                if (!gameObject->IsInSkillupList(_player->GetGUID()))
+                    return false;
+
+                return IsGatherableNodeForSkill(gameObject, _player, _skillId);
             }
 
         private:
             Player* _player;
-            uint32 _skillId;
-            float _range;
+            uint32  _skillId;
+            float   _range;
         };
 
-        GameObject* FindAutoGatherNode(
-            Player* player,
-            uint32 skillId)
+        GameObject* FindAutoGatherNode(Player* player, uint32 skillId)
         {
-            if (!player || !player->GetGroup())
+            if (!player)
                 return nullptr;
 
-            float searchRange = MaxDistance;
-
-            if (searchRange < 1.0f)
-                searchRange = 1.0f;
+            float const range = SearchRadius();
 
             std::list<GameObject*> nodes;
+            AutoGatherNodeCheck check(player, skillId, range);
+            Acore::GameObjectListSearcher<AutoGatherNodeCheck> searcher(player, nodes, check);
 
-            AutoGatherNodeCheck check(
-                player,
-                skillId,
-                searchRange);
-
-            Acore::GameObjectListSearcher<
-                AutoGatherNodeCheck> searcher(
-                    player,
-                    nodes,
-                    check);
-
-            Cell::VisitObjects(
-                player,
-                searcher,
-                searchRange);
+            Cell::VisitObjects(player, searcher, range);
 
             if (nodes.empty())
                 return nullptr;
 
-            auto itr =
-                std::min_element(
-                    nodes.begin(),
-                    nodes.end(),
-                    [player](
-                        GameObject* left,
-                        GameObject* right)
-                    {
-                        return player->GetDistance(left) <
-                               player->GetDistance(right);
-                    });
-
-            return itr != nodes.end()
-                ? *itr
-                : nullptr;
+            return *std::min_element(nodes.begin(), nodes.end(),
+                [player](GameObject* left, GameObject* right)
+                {
+                    return player->GetDistance(left) < player->GetDistance(right);
+                });
         }
 
         /*
-         * Detect both:
-         *   - normal AzerothCore skinning
-         *   - mod-auto-gather AutoSkinCreature()
+         * Detects both normal AzerothCore skinning and
+         * mod-auto-gather's AutoSkinCreature().
          */
         class SkinningCreatureCheck
         {
         public:
-            SkinningCreatureCheck(
-                Player* player,
-                float range)
-                : _player(player),
-                  _range(range)
+            SkinningCreatureCheck(Player* player, float range)
+                : _player(player), _range(range) { }
+
+            bool operator()(Creature* creature)
             {
-            }
-
-            bool operator()(
-                Creature* creature)
-            {
-                if (!creature)
+                if (!creature || creature->IsAlive() || !creature->IsInWorld())
                     return false;
 
-                if (creature->IsAlive())
+                if (!creature->IsInMap(_player) || !creature->InSamePhase(_player))
                     return false;
 
-                if (!creature->IsInWorld())
+                if (!_player->IsWithinDist(creature, _range, false))
                     return false;
 
-                if (!creature->IsInMap(_player))
+                if (creature->loot.loot_type != LOOT_SKINNING)
                     return false;
 
-                if (!creature->InSamePhase(_player))
+                CreatureTemplate const* creatureInfo = creature->GetCreatureTemplate();
+
+                if (!creatureInfo || !creatureInfo->SkinLootId)
                     return false;
 
-                if (!_player->IsWithinDist(
-                        creature,
-                        _range,
-                        false))
-                {
+                if (creatureInfo->GetRequiredLootSkill() != SKILL_SKINNING)
                     return false;
-                }
-
-                if (creature->loot.loot_type !=
-                    LOOT_SKINNING)
-                {
-                    return false;
-                }
-
-                CreatureTemplate const* creatureInfo =
-                    creature->GetCreatureTemplate();
-
-                if (!creatureInfo)
-                    return false;
-
-                if (!creatureInfo->SkinLootId)
-                    return false;
-
-                if (creatureInfo->GetRequiredLootSkill() !=
-                    SKILL_SKINNING)
-                {
-                    return false;
-                }
 
                 /*
-                 * Both normal Skinning and AutoSkinCreature()
-                 * remove UNIT_FLAG_SKINNABLE after success.
+                 * Both normal skinning and AutoSkinCreature() remove
+                 * UNIT_FLAG_SKINNABLE on success.
                  */
-                if (creature->HasUnitFlag(
-                        UNIT_FLAG_SKINNABLE))
-                {
-                    return false;
-                }
-
-                if (!creature->isTappedBy(_player))
+                if (creature->HasUnitFlag(UNIT_FLAG_SKINNABLE))
                     return false;
 
-                return true;
+                return creature->isTappedBy(_player);
             }
 
         private:
             Player* _player;
-            float _range;
+            float   _range;
         };
 
-        Creature* FindSkinningCreature(
-            Player* player)
+        Creature* FindSkinningCreature(Player* player)
         {
-            if (!player || !player->GetGroup())
+            if (!player)
                 return nullptr;
 
-            float searchRange = MaxDistance;
-
-            if (searchRange < 1.0f)
-                searchRange = 1.0f;
+            float const range = SearchRadius();
 
             std::list<Creature*> creatures;
+            SkinningCreatureCheck check(player, range);
+            Acore::CreatureListSearcher<SkinningCreatureCheck> searcher(player, creatures, check);
 
-            SkinningCreatureCheck check(
-                player,
-                searchRange);
-
-            Acore::CreatureListSearcher<
-                SkinningCreatureCheck> searcher(
-                    player,
-                    creatures,
-                    check);
-
-            Cell::VisitObjects(
-                player,
-                searcher,
-                searchRange);
+            Cell::VisitObjects(player, searcher, range);
 
             if (creatures.empty())
                 return nullptr;
 
-            auto itr =
-                std::min_element(
-                    creatures.begin(),
-                    creatures.end(),
-                    [player](
-                        Creature* left,
-                        Creature* right)
-                    {
-                        return player->GetDistance(left) <
-                               player->GetDistance(right);
-                    });
-
-            return itr != creatures.end()
-                ? *itr
-                : nullptr;
+            return *std::min_element(creatures.begin(), creatures.end(),
+                [player](Creature* left, Creature* right)
+                {
+                    return player->GetDistance(left) < player->GetDistance(right);
+                });
         }
 
-        bool WasSkinningCreatureRecentlyProcessed(
-            Player* player,
-            Creature* creature)
+        /* ==========================================================
+         * Configuration loading
+         * ========================================================== */
+
+        uint32 ClampMultiplier(uint32 value)
         {
-            if (!player || !creature)
-                return true;
-
-            uint64 playerKey =
-                player->GetGUID().GetRawValue();
-
-            auto itr =
-                RecentSkinnings.find(playerKey);
-
-            if (itr == RecentSkinnings.end())
-                return false;
-
-            if (IsRecentSkinningExpired(
-                    itr->second))
-            {
-                RecentSkinnings.erase(itr);
-                return false;
-            }
-
-            return itr->second.creature ==
-                   creature->GetGUID();
+            return std::max<uint32>(1, std::min(value, MAX_PROFESSION_MULTIPLIER));
         }
 
-        void MarkSkinningCreatureProcessed(
-            Player* player,
-            Creature* creature)
+        uint32 ReadMultiplier(char const* key, char const* legacyKey)
         {
-            if (!player || !creature)
+            uint32 const fallback = legacyKey
+                ? sConfigMgr->GetOption<uint32>(legacyKey, 1)
+                : 1;
+
+            return ClampMultiplier(sConfigMgr->GetOption<uint32>(key, fallback));
+        }
+
+        void LoadConfig()
+        {
+            g_settings.Enabled = sConfigMgr->GetOption<bool>("ProfessionLootParty.Enable", true);
+
+            ProfessionSettings& mining    = g_settings.Professions[PROFESSION_MINING];
+            ProfessionSettings& herbalism = g_settings.Professions[PROFESSION_HERBALISM];
+            ProfessionSettings& skinning  = g_settings.Professions[PROFESSION_SKINNING];
+
+            mining.Enabled    = sConfigMgr->GetOption<bool>("ProfessionLootParty.Mining", true);
+            herbalism.Enabled = sConfigMgr->GetOption<bool>("ProfessionLootParty.Herbalism", true);
+            skinning.Enabled  = sConfigMgr->GetOption<bool>("ProfessionLootParty.Skinning", true);
+
+            /* Deprecated *Multiplier keys stay valid as loot fallbacks. */
+            mining.LootMultiplier = ReadMultiplier(
+                "ProfessionLootParty.MiningLootMultiplier", "ProfessionLootParty.MiningMultiplier");
+            herbalism.LootMultiplier = ReadMultiplier(
+                "ProfessionLootParty.HerbalismLootMultiplier", "ProfessionLootParty.HerbalismMultiplier");
+            skinning.LootMultiplier = ReadMultiplier(
+                "ProfessionLootParty.SkinningLootMultiplier", "ProfessionLootParty.SkinningMultiplier");
+
+            mining.SkillMultiplier = ReadMultiplier(
+                "ProfessionLootParty.MiningSkillMultiplier", nullptr);
+            herbalism.SkillMultiplier = ReadMultiplier(
+                "ProfessionLootParty.HerbalismSkillMultiplier", nullptr);
+            skinning.SkillMultiplier = ReadMultiplier(
+                "ProfessionLootParty.SkinningSkillMultiplier", nullptr);
+
+            g_settings.IncludeRaid      = sConfigMgr->GetOption<bool>("ProfessionLootParty.Raid", true);
+            g_settings.RequireSkill     = sConfigMgr->GetOption<bool>("ProfessionLootParty.RequireSkill", true);
+            g_settings.RequireNodeSkill = sConfigMgr->GetOption<bool>("ProfessionLootParty.RequireNodeSkill", true);
+            g_settings.RequireGroup     = sConfigMgr->GetOption<bool>("ProfessionLootParty.RequireGroup", true);
+            g_settings.ApplyToGatherer  = sConfigMgr->GetOption<bool>("ProfessionLootParty.ApplyToGatherer", true);
+            g_settings.AutoGatherCompat = sConfigMgr->GetOption<bool>("ProfessionLootParty.AutoGatherCompat", true);
+            g_settings.Announce         = sConfigMgr->GetOption<bool>("ProfessionLootParty.Announce", false);
+            g_settings.Debug            = sConfigMgr->GetOption<bool>("ProfessionLootParty.Debug", false);
+
+            g_settings.MaxRecipients    = sConfigMgr->GetOption<uint32>("ProfessionLootParty.MaxRecipients", 0);
+
+            g_settings.MaxDistance = std::max(0.0f, std::min(
+                sConfigMgr->GetOption<float>("ProfessionLootParty.Distance", 100.0f), MAX_CONFIG_DISTANCE));
+
+            g_settings.SearchDistance = std::max(1.0f, std::min(
+                sConfigMgr->GetOption<float>("ProfessionLootParty.SearchDistance", 10.0f), MAX_CONFIG_SEARCH));
+        }
+
+        void LogConfig()
+        {
+            LOG_INFO("server.loading", ">> ProfessionLootParty: {}",
+                g_settings.Enabled ? "Enabled" : "Disabled");
+
+            if (!g_settings.Enabled)
                 return;
 
-            RecentSkinning recent;
+            static char const* const names[PROFESSION_MAX] = { "Mining", "Herbalism", "Skinning" };
 
-            recent.gatherer =
-                player->GetGUID();
+            for (uint8 slot = 0; slot < PROFESSION_MAX; ++slot)
+            {
+                ProfessionSettings const& profession = g_settings.Professions[slot];
 
-            recent.creature =
-                creature->GetGUID();
+                LOG_INFO("server.loading", "   {}: {} Loot={}x Skill={}x",
+                    names[slot], profession.Enabled ? "on" : "off",
+                    profession.LootMultiplier, profession.SkillMultiplier);
+            }
 
-            recent.createdAt =
-                GetMSTime();
+            std::string const recipients = g_settings.MaxRecipients
+                ? std::to_string(g_settings.MaxRecipients)
+                : std::string("unlimited");
 
-            RecentSkinnings[
-                player->GetGUID().GetRawValue()
-            ] = recent;
+            LOG_INFO("server.loading", "   Distance={} SearchDistance={} MaxRecipients={}",
+                g_settings.MaxDistance, g_settings.SearchDistance, recipients);
+
+            LOG_INFO("server.loading", "   Raid={} RequireGroup={} RequireSkill={} RequireNodeSkill={}",
+                g_settings.IncludeRaid, g_settings.RequireGroup,
+                g_settings.RequireSkill, g_settings.RequireNodeSkill);
+
+            LOG_INFO("server.loading", "   ApplyToGatherer={} AutoGatherCompat={} Announce={}",
+                g_settings.ApplyToGatherer, g_settings.AutoGatherCompat, g_settings.Announce);
         }
-    }
+    } // anonymous namespace
+
+    /* ==============================================================
+     * Public API
+     * ============================================================== */
 
     bool IsEnabled()
     {
-        return Enabled;
+        return g_settings.Enabled;
     }
 
-    bool IsProfessionEnabled(
-        uint32 skillId)
+    ModuleSettings const& GetSettings()
     {
-        if (!Enabled)
+        return g_settings;
+    }
+
+    bool IsProfessionEnabled(uint32 skillId)
+    {
+        if (!g_settings.Enabled)
             return false;
 
-        switch (skillId)
-        {
-            case SKILL_MINING:
-                return MiningEnabled;
+        ProfessionSettings const* profession = SettingsForSkill(skillId);
 
-            case SKILL_HERBALISM:
-                return HerbalismEnabled;
-
-            case SKILL_SKINNING:
-                return SkinningEnabled;
-
-            default:
-                return false;
-        }
+        return profession && profession->Enabled;
     }
 
-    uint32 GetProfessionLootMultiplier(
-        uint32 skillId)
+    uint32 GetProfessionLootMultiplier(uint32 skillId)
     {
-        if (!Enabled)
-            return 0;
+        ProfessionSettings const* profession = SettingsForSkill(skillId);
 
-        return GetLootMultiplierInternal(skillId);
+        return (g_settings.Enabled && profession) ? profession->LootMultiplier : 0;
     }
 
-    uint32 GetProfessionSkillMultiplier(
-        uint32 skillId)
+    uint32 GetProfessionSkillMultiplier(uint32 skillId)
     {
-        if (!Enabled)
-            return 0;
+        ProfessionSettings const* profession = SettingsForSkill(skillId);
 
-        return GetSkillMultiplierInternal(skillId);
+        return (g_settings.Enabled && profession) ? profession->SkillMultiplier : 0;
     }
 
-    void AddPendingGather(
-        Player* gatherer,
-        GameObject* gameObject)
+    void AddPendingGather(Player* gatherer, GameObject* gameObject)
     {
         if (!gatherer || !gameObject)
             return;
 
-        if (!gatherer->GetGroup())
-            return;
+        PendingGatherEntry entry;
+        entry.gameObject = gameObject->GetGUID();
+        entry.createdAt  = NowMS();
 
-        PendingGather pending;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
 
-        pending.gatherer =
-            gatherer->GetGUID();
+            PruneLocked();
 
-        pending.gameObject =
-            gameObject->GetGUID();
+            g_pendingGathers[gatherer->GetGUID().GetRawValue()] = entry;
+        }
 
-        pending.createdAt =
-            GetMSTime();
-
-        PendingGathers[
-            gatherer->GetGUID().GetRawValue()
-        ] = pending;
-
-        DebugLog(
-            "Gathering operation queued.",
-            gatherer,
-            gameObject);
+        if (g_settings.Debug)
+        {
+            DebugLog("Gathering queued. Player=" + DescribePlayer(gatherer) +
+                " Entry=" + std::to_string(gameObject->GetEntry()));
+        }
     }
 
-    void RemovePendingGather(
-        ObjectGuid playerGuid)
+    void RemovePendingGather(ObjectGuid playerGuid)
     {
-        PendingGathers.erase(
-            playerGuid.GetRawValue());
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+
+        g_pendingGathers.erase(playerGuid.GetRawValue());
     }
 
-    bool ProcessPendingGather(
-        Player* gatherer,
-        uint32 skillId)
+    void RemoveRecentSkinning(ObjectGuid playerGuid)
     {
-        if (!gatherer)
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+
+        g_recentSkinnings.erase(playerGuid.GetRawValue());
+    }
+
+    void ForgetPlayer(ObjectGuid playerGuid)
+    {
+        uint64 const key = playerGuid.GetRawValue();
+
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+
+        g_pendingGathers.erase(key);
+        g_recentSkinnings.erase(key);
+    }
+
+    bool ProcessPendingGather(Player* gatherer, uint32 skillId)
+    {
+        if (!gatherer || !IsGatheringSkill(skillId))
             return false;
 
-        if (!IsGatheringSkill(skillId))
-            return false;
+        PendingGatherEntry entry;
 
-        auto itr =
-            PendingGathers.find(
-                gatherer->GetGUID().GetRawValue());
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
 
-        if (itr == PendingGathers.end())
-            return false;
+            auto itr = g_pendingGathers.find(gatherer->GetGUID().GetRawValue());
 
-        PendingGather pending =
-            itr->second;
+            if (itr == g_pendingGathers.end())
+                return false;
 
-        PendingGathers.erase(itr);
+            entry = itr->second;
+            g_pendingGathers.erase(itr);
+        }
 
-        if (IsPendingExpired(pending))
+        /*
+         * From here on the operation is claimed: return true so the
+         * caller does not fall through to the AutoGather path.
+         */
+        if (IsExpired(entry.createdAt, PENDING_TIMEOUT_MS))
             return true;
 
-        if (!IsProfessionEnabled(skillId))
+        if (!ShouldProcess(gatherer, skillId))
             return true;
 
-        GameObject* gameObject =
-            ObjectAccessor::GetGameObject(
-                *gatherer,
-                pending.gameObject);
+        GameObject* gameObject = ObjectAccessor::GetGameObject(*gatherer, entry.gameObject);
 
         if (!gameObject)
             return true;
 
         /*
-         * Normal AzerothCore EffectOpenLock() adds the node to the
-         * skill-up list before calling UpdateGatherSkill().
+         * Core EffectOpenLock() adds the node to the skill-up list
+         * before calling UpdateGatherSkill().
          */
-        if (!gameObject->IsInSkillupList(
-                gatherer->GetGUID()))
-        {
+        if (!gameObject->IsInSkillupList(gatherer->GetGUID()))
             return true;
-        }
 
-        DistributeGatherLoot(
-            gatherer,
-            gameObject,
-            skillId);
+        DistributeGatherLoot(gatherer, gameObject, skillId);
 
         return true;
     }
 
-    void ProcessAutoGather(
-        Player* gatherer,
-        uint32 skillId)
+    void ProcessAutoGather(Player* gatherer, uint32 skillId)
     {
-        if (!gatherer)
+        if (!g_settings.AutoGatherCompat)
             return;
 
-        if (!IsGatheringSkill(skillId))
+        if (!gatherer || !IsGatheringSkill(skillId))
             return;
 
-        if (!IsProfessionEnabled(skillId))
+        if (!ShouldProcess(gatherer, skillId))
             return;
 
-        if (!gatherer->GetGroup())
-            return;
-
-        GameObject* gameObject =
-            FindAutoGatherNode(
-                gatherer,
-                skillId);
+        GameObject* gameObject = FindAutoGatherNode(gatherer, skillId);
 
         if (!gameObject)
             return;
 
-        /*
-         * Do not touch the GameObject lifecycle.
-         * mod-auto-gather owns it.
-         */
-        DistributeGatherLoot(
-            gatherer,
-            gameObject,
-            skillId);
+        /* The GameObject lifecycle stays owned by the gathering implementation. */
+        DistributeGatherLoot(gatherer, gameObject, skillId);
     }
 
-    bool ProcessSkinning(
-        Player* skinner)
+    bool ProcessSkinning(Player* skinner)
     {
-        if (!skinner)
+        if (!skinner || !ShouldProcess(skinner, SKILL_SKINNING))
             return false;
 
-        if (!IsEnabled())
-            return false;
-
-        if (!IsProfessionEnabled(
-                SKILL_SKINNING))
-        {
-            return false;
-        }
-
-        if (!skinner->GetGroup())
-            return false;
-
-        Creature* creature =
-            FindSkinningCreature(
-                skinner);
+        Creature* creature = FindSkinningCreature(skinner);
 
         if (!creature)
             return false;
 
-        if (WasSkinningCreatureRecentlyProcessed(
-                skinner,
-                creature))
-        {
+        if (WasSkinningCreatureRecentlyProcessed(skinner, creature))
             return true;
-        }
 
-        MarkSkinningCreatureProcessed(
-            skinner,
-            creature);
+        MarkSkinningCreatureProcessed(skinner, creature);
 
-        DistributeSkinningLoot(
-            skinner,
-            creature);
+        DistributeSkinningLoot(skinner, creature);
 
         return true;
     }
 
-    void RemoveRecentSkinning(
-        ObjectGuid playerGuid)
-    {
-        RecentSkinnings.erase(
-            playerGuid.GetRawValue());
-    }
+    /* ==============================================================
+     * Scripts
+     * ============================================================== */
 
     PlayerScript::PlayerScript()
-        : ::PlayerScript(
-            "ProfessionLootParty_PlayerScript")
+        : ::PlayerScript("ProfessionLootParty_PlayerScript")
     {
     }
 
-    void PlayerScript::OnPlayerUpdateGatheringSkill(
-        Player* player,
-        uint32 skillId,
-        uint32 /*currentLevel*/,
-        uint32 /*gray*/,
-        uint32 /*green*/,
-        uint32 /*yellow*/,
-        uint32& /*gain*/)
+    void PlayerScript::OnPlayerUpdateGatheringSkill(Player* player, uint32 skillId,
+        uint32 /*currentLevel*/, uint32 /*gray*/, uint32 /*green*/, uint32 /*yellow*/, uint32& /*gain*/)
     {
-        if (!player || !IsEnabled())
+        if (!player || !g_settings.Enabled)
             return;
 
         /*
-         * Critical re-entrancy protection.
-         *
-         * SimulateGatherSkillAttempt() deliberately calls
-         * UpdateGatherSkill(), which calls this hook again.
-         *
-         * The nested invocation must NOT be interpreted as another
-         * real gathering operation.
+         * Critical re-entrancy protection: the module calls
+         * UpdateGatherSkill() itself, which re-enters this hook.
          */
-        if (IsSimulatedSkillUpdate(player))
+        if (t_simulating)
             return;
 
         if (IsSkinningSkill(skillId))
@@ -1417,276 +1167,81 @@ namespace ProfessionLootParty
         if (!IsGatheringSkill(skillId))
             return;
 
-        /*
-         * First attempt to match normal AzerothCore gathering.
-         */
-        if (ProcessPendingGather(
-                player,
-                skillId))
-        {
+        /* Normal AzerothCore gathering first. */
+        if (ProcessPendingGather(player, skillId))
             return;
-        }
 
-        /*
-         * Otherwise this can be mod-auto-gather.
-         */
-        ProcessAutoGather(
-            player,
-            skillId);
+        /* Otherwise this may be mod-auto-gather. */
+        ProcessAutoGather(player, skillId);
     }
 
-    void PlayerScript::OnPlayerLogout(
-        Player* player)
+    void PlayerScript::OnPlayerLogout(Player* player)
     {
         if (!player)
             return;
 
-        RemovePendingGather(
-            player->GetGUID());
-
-        RemoveRecentSkinning(
-            player->GetGUID());
-
-        SimulatedSkillUpdates.erase(
-            player->GetGUID().GetRawValue());
+        ForgetPlayer(player->GetGUID());
     }
 
     GameObjectScript::GameObjectScript()
-        : ::AllGameObjectScript(
-            "ProfessionLootParty_GameObjectScript")
+        : ::AllGameObjectScript("ProfessionLootParty_GameObjectScript")
     {
     }
 
-    void GameObjectScript::OnGameObjectLootStateChanged(
-        GameObject* gameObject,
-        uint32 state,
-        Unit* unit)
+    void GameObjectScript::OnGameObjectLootStateChanged(GameObject* gameObject, uint32 state, Unit* unit)
     {
-        if (!IsEnabled())
+        if (!g_settings.Enabled || !gameObject || !unit)
             return;
 
-        if (!gameObject || !unit)
+        if (state != GO_ACTIVATED || !unit->IsPlayer())
             return;
 
-        if (!unit->IsPlayer())
+        /*
+         * Only queue actual gathering nodes.
+         *
+         * This hook fires for doors, chests, quest objects and every
+         * other activated GameObject, so filtering here removes a very
+         * large number of pointless map insertions and eliminates
+         * false positives from non-gathering interactions.
+         */
+        if (!IsGatheringNode(gameObject))
             return;
 
-        if (state != GO_ACTIVATED)
-            return;
-
-        Player* gatherer =
-            unit->ToPlayer();
+        Player* gatherer = unit->ToPlayer();
 
         if (!gatherer)
             return;
 
-        if (!gatherer->GetGroup())
+        if (g_settings.RequireGroup && !gatherer->GetGroup())
             return;
 
         /*
-         * Do not guess Mining vs Herbalism here.
-         *
-         * AzerothCore supplies the actual SkillType through
-         * OnPlayerUpdateGatheringSkill().
+         * Mining vs Herbalism is not guessed here; the real SkillType
+         * arrives with OnPlayerUpdateGatheringSkill().
          */
-        AddPendingGather(
-            gatherer,
-            gameObject);
+        AddPendingGather(gatherer, gameObject);
     }
 
     ConfigScript::ConfigScript()
-        : ::WorldScript(
-            "ProfessionLootParty_ConfigScript")
+        : ::WorldScript("ProfessionLootParty_ConfigScript")
     {
     }
 
-    void ConfigScript::OnBeforeConfigLoad(
-        bool /*reload*/)
+    /*
+     * Both hooks are implemented on purpose: depending on the core
+     * revision module .conf files are merged before or after
+     * OnBeforeConfigLoad(). Loading twice is harmless and idempotent,
+     * only the later pass logs the summary.
+     */
+    void ConfigScript::OnBeforeConfigLoad(bool /*reload*/)
     {
-        Enabled =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.Enable",
-                true);
+        LoadConfig();
+    }
 
-        MiningEnabled =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.Mining",
-                true);
-
-        HerbalismEnabled =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.Herbalism",
-                true);
-
-        SkinningEnabled =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.Skinning",
-                true);
-
-        /*
-         * New independent loot multipliers.
-         *
-         * Old ProfessionLootParty.*Multiplier settings are accepted
-         * as a backwards-compatible fallback for loot only.
-         */
-        MiningLootMultiplier =
-            sConfigMgr->GetOption<uint32>(
-                "ProfessionLootParty.MiningLootMultiplier",
-                sConfigMgr->GetOption<uint32>(
-                    "ProfessionLootParty.MiningMultiplier",
-                    1));
-
-        HerbalismLootMultiplier =
-            sConfigMgr->GetOption<uint32>(
-                "ProfessionLootParty.HerbalismLootMultiplier",
-                sConfigMgr->GetOption<uint32>(
-                    "ProfessionLootParty.HerbalismMultiplier",
-                    1));
-
-        SkinningLootMultiplier =
-            sConfigMgr->GetOption<uint32>(
-                "ProfessionLootParty.SkinningLootMultiplier",
-                sConfigMgr->GetOption<uint32>(
-                    "ProfessionLootParty.SkinningMultiplier",
-                    1));
-
-        /*
-         * Independent skill-up multipliers.
-         */
-        MiningSkillMultiplier =
-            sConfigMgr->GetOption<uint32>(
-                "ProfessionLootParty.MiningSkillMultiplier",
-                1);
-
-        HerbalismSkillMultiplier =
-            sConfigMgr->GetOption<uint32>(
-                "ProfessionLootParty.HerbalismSkillMultiplier",
-                1);
-
-        SkinningSkillMultiplier =
-            sConfigMgr->GetOption<uint32>(
-                "ProfessionLootParty.SkinningSkillMultiplier",
-                1);
-
-        /*
-         * Keep both multipliers >= 1.
-         *
-         * The module's basic behavior always gives eligible
-         * profession users one base roll/attempt.
-         */
-        MiningLootMultiplier =
-            std::max<uint32>(
-                1,
-                std::min(
-                    MiningLootMultiplier,
-                    MAX_PROFESSION_MULTIPLIER));
-
-        HerbalismLootMultiplier =
-            std::max<uint32>(
-                1,
-                std::min(
-                    HerbalismLootMultiplier,
-                    MAX_PROFESSION_MULTIPLIER));
-
-        SkinningLootMultiplier =
-            std::max<uint32>(
-                1,
-                std::min(
-                    SkinningLootMultiplier,
-                    MAX_PROFESSION_MULTIPLIER));
-
-        MiningSkillMultiplier =
-            std::max<uint32>(
-                1,
-                std::min(
-                    MiningSkillMultiplier,
-                    MAX_PROFESSION_MULTIPLIER));
-
-        HerbalismSkillMultiplier =
-            std::max<uint32>(
-                1,
-                std::min(
-                    HerbalismSkillMultiplier,
-                    MAX_PROFESSION_MULTIPLIER));
-
-        SkinningSkillMultiplier =
-            std::max<uint32>(
-                1,
-                std::min(
-                    SkinningSkillMultiplier,
-                    MAX_PROFESSION_MULTIPLIER));
-
-        IncludeRaid =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.Raid",
-                true);
-
-        RequireSkill =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.RequireSkill",
-                true);
-
-        MaxDistance =
-            sConfigMgr->GetOption<float>(
-                "ProfessionLootParty.Distance",
-                100.0f);
-
-        Debug =
-            sConfigMgr->GetOption<bool>(
-                "ProfessionLootParty.Debug",
-                false);
-
-        if (MaxDistance < 0.0f)
-            MaxDistance = 0.0f;
-
-        LOG_INFO(
-            "server.loading",
-            ">> ProfessionLootParty: {}",
-            Enabled ? "Enabled" : "Disabled");
-
-        LOG_INFO(
-            "server.loading",
-            "   Mining: {} Loot={}x Skill={}x",
-            MiningEnabled,
-            MiningLootMultiplier,
-            MiningSkillMultiplier);
-
-        LOG_INFO(
-            "server.loading",
-            "   Herbalism: {} Loot={}x Skill={}x",
-            HerbalismEnabled,
-            HerbalismLootMultiplier,
-            HerbalismSkillMultiplier);
-
-        LOG_INFO(
-            "server.loading",
-            "   Skinning: {} Loot={}x Skill={}x",
-            SkinningEnabled,
-            SkinningLootMultiplier,
-            SkinningSkillMultiplier);
-
-        LOG_INFO(
-            "server.loading",
-            "   Raid: {}",
-            IncludeRaid);
-
-        LOG_INFO(
-            "server.loading",
-            "   RequireSkill: {}",
-            RequireSkill);
-
-        LOG_INFO(
-            "server.loading",
-            "   Distance: {}",
-            MaxDistance);
-
-        LOG_INFO(
-            "server.loading",
-            "   AutoGather compatibility: enabled");
-
-        LOG_INFO(
-            "server.loading",
-            "   Skinning compatibility: normal + AutoGather");
+    void ConfigScript::OnAfterConfigLoad(bool /*reload*/)
+    {
+        LoadConfig();
+        LogConfig();
     }
 }
 

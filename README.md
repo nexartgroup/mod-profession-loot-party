@@ -1,6 +1,8 @@
 # mod-profession-loot-party
 
-AzerothCore WotLK 3.3.5a module that gives eligible group/raid members independent profession loot rolls when another member successfully gathers a resource.
+AzerothCore WotLK 3.3.5a module that gives eligible group/raid members
+independent profession loot rolls when another member successfully gathers a
+resource.
 
 Supported professions:
 
@@ -10,22 +12,17 @@ Supported professions:
 
 Supported gathering implementations:
 
-* Normal AzerothCore Mining
-* Normal AzerothCore Herbalism
-* Normal AzerothCore Skinning
-* `mod-auto-gather` Mining
-* `mod-auto-gather` Herbalism
-* `mod-auto-gather` Skinning
+* Normal AzerothCore Mining / Herbalism / Skinning
+* `mod-auto-gather` Mining / Herbalism / Skinning
 
 ## Features
 
 ### Independent loot
 
-Each eligible player receives a fresh roll against the original profession loot table.
+Each eligible player receives a fresh roll against the original profession loot
+table. The module does not copy the original player's generated loot.
 
-The module does not copy the original player's generated loot.
-
-For example, if a Mining node produces:
+For example, a single Mining node may produce:
 
 ```text
 Player A: 2 Ore
@@ -33,13 +30,12 @@ Player B: 3 Ore + rare item
 Player C: 1 Ore
 ```
 
-each result was independently generated.
+Each result was generated independently.
 
 ### Profession requirement
 
-Only group members who have the relevant profession receive the additional loot and skill attempts.
-
-Example:
+Only group members who have the relevant profession receive the additional loot
+and skill attempts.
 
 ```text
 Alice - Mining
@@ -55,179 +51,80 @@ Bob   -> independent Mining result
 Carol -> nothing
 ```
 
+By default a receiver must also meet the node's own skill requirement, so a
+member with Mining 1 cannot farm Titanium through a group mate. See
+`RequireNodeSkill`.
+
 ### Independent loot and skill multipliers
 
-Loot and profession leveling are configured separately.
-
-Each profession has:
+Loot and profession leveling are configured separately per profession:
 
 ```text
-LootMultiplier
-SkillMultiplier
-```
-
-This allows configurations such as:
-
-```text
-Mining:
-    2x loot
-    1x skill
-
-Herbalism:
-    4x loot
-    3x skill
-
-Skinning:
-    5x loot
-    2x skill
+Mining:     2x loot / 1x skill
+Herbalism:  4x loot / 3x skill
+Skinning:   5x loot / 2x skill
 ```
 
 ## How multipliers work
 
-The multiplier represents the **total number of rolls/attempts for an eligible profession user**.
+The multiplier is the **total number of rolls/attempts for an eligible
+profession user**. The original gatherer's normal AzerothCore operation is
+never replaced.
 
-The original gatherer's normal AzerothCore operation is not replaced.
-
-### Loot multiplier
-
-With:
-
-```ini
-ProfessionLootParty.MiningLootMultiplier = 3
-```
-
-when Alice mines:
+With `ProfessionLootParty.MiningLootMultiplier = 3`, when Alice mines:
 
 ```text
-Alice:
-    normal AzerothCore loot
-    + 2 additional independent loot rolls
-
-Bob:
-    3 independent loot rolls
-
-Carol:
-    no Mining -> nothing
+Alice:  normal AzerothCore loot + 2 additional independent rolls
+Bob:    3 independent loot rolls
+Carol:  no Mining -> nothing
 ```
 
-### Skill multiplier
-
-With:
-
-```ini
-ProfessionLootParty.MiningSkillMultiplier = 3
-```
-
-when Alice mines:
+With `ProfessionLootParty.MiningSkillMultiplier = 3`:
 
 ```text
-Alice:
-    normal AzerothCore skill-up attempt
-    + 2 additional skill-up attempts
-
-Bob:
-    3 skill-up attempts
-
-Carol:
-    no Mining -> nothing
+Alice:  normal skill-up attempt + 2 additional attempts
+Bob:    3 skill-up attempts
+Carol:  no Mining -> nothing
 ```
 
-The module uses:
+Every simulated attempt goes through:
 
 ```cpp
 Player::UpdateGatherSkill()
 ```
 
-for every simulated skill-up attempt.
+The module never writes the skill value directly, so AzerothCore stays
+responsible for skill-up chance, skill caps, `SkillGain.*` configuration,
+skill-up script hooks, profession rewards and the normal Skinning/Mining
+modifiers.
 
-It does **not** directly increase the profession value.
-
-Therefore the normal AzerothCore skill-up system remains responsible for:
-
-* skill-up chance
-* skill caps
-* server skill gain configuration
-* skill-up script hooks
-* profession skill rewards
-* the normal Skinning/Mining modifiers
-
-A skill-up attempt can therefore fail normally. `3x` means three attempts, not a forced `+3` skill value.
-
-## Example configuration
-
-### 2x loot, normal leveling
-
-```ini
-ProfessionLootParty.MiningLootMultiplier = 2
-ProfessionLootParty.MiningSkillMultiplier = 1
-```
-
-Result:
-
-```text
-Alice:
-    normal loot + 1 additional loot
-    normal skill attempt
-
-Bob:
-    2 loot rolls
-    1 skill attempt
-```
-
-### 4x loot, 3x leveling
-
-```ini
-ProfessionLootParty.MiningLootMultiplier = 4
-ProfessionLootParty.MiningSkillMultiplier = 3
-```
-
-Result:
-
-```text
-Alice:
-    normal loot + 3 additional loot
-    normal skill attempt + 2 additional attempts
-
-Bob:
-    4 loot rolls
-    3 skill attempts
-
-Carol:
-    no Mining -> nothing
-```
+An attempt can fail normally. `3x` means three chances, not a forced `+3`.
 
 ## Skinning
 
-Skinning supports both normal AzerothCore Skinning and `mod-auto-gather`.
-
-The module detects the successful Skinning operation through the resulting corpse state rather than changing the Skinning implementation itself.
-
-The expected successful Skinning state is:
+Both normal AzerothCore Skinning and `mod-auto-gather` are supported. The
+module detects a successful operation from the resulting corpse state rather
+than by modifying the Skinning implementation:
 
 * dead creature
 * valid `SkinLootId`
 * `LOOT_SKINNING`
 * `UNIT_FLAG_SKINNABLE` removed
+* tapped by the skinner
 
-This is compatible with both normal AzerothCore Skinning and `mod-auto-gather`'s `AutoSkinCreature()` behavior.
-
-For Skinning, the normal elite multiplier is preserved when simulated skill attempts call:
+The elite multiplier is preserved for simulated attempts:
 
 ```cpp
-UpdateGatherSkill(
-    SKILL_SKINNING,
-    pureSkillValue,
-    requiredSkill,
+UpdateGatherSkill(SKILL_SKINNING, pureSkillValue, requiredSkill,
     creature->isElite() ? 2 : 1);
 ```
 
 ## Installation
 
-Copy the module into the AzerothCore `modules` directory:
-
 ```text
 modules/
 └── mod-profession-loot-party/
+    ├── CMakeLists.txt
     ├── conf/
     │   └── mod-profession-loot-party.conf.dist
     └── src/
@@ -235,45 +132,9 @@ modules/
         └── ProfessionLootParty.h
 ```
 
-Re-run CMake and rebuild AzerothCore.
-
-Then copy:
-
-```text
-mod-profession-loot-party.conf.dist
-```
-
-to your server configuration directory as:
-
-```text
-mod-profession-loot-party.conf
-```
-
-Enable the desired settings.
-
-## Important implementation detail
-
-`Player::UpdateGatherSkill()` calls the `OnPlayerUpdateGatheringSkill` script hook before performing the actual skill-up calculation.
-
-Because this module uses `UpdateGatherSkill()` to simulate additional profession attempts, the module contains a re-entrancy guard.
-
-Without that guard, a simulated skill-up could be incorrectly detected as a new gathering operation and distribute another round of loot.
-
-## Maximum multiplier
-
-For safety, each multiplier is clamped to:
-
-```text
-1 - 100
-```
-
-This prevents an accidental configuration such as:
-
-```ini
-ProfessionLootParty.MiningLootMultiplier = 1000000
-```
-
-from generating an extreme number of loot operations.
+Re-run CMake and rebuild AzerothCore, then copy
+`mod-profession-loot-party.conf.dist` to your configuration directory as
+`mod-profession-loot-party.conf`.
 
 ## Configuration
 
@@ -283,49 +144,67 @@ from generating an extreme number of loot operations.
 ProfessionLootParty.Enable = 1
 ```
 
-### Mining
+### Professions
 
 ```ini
 ProfessionLootParty.Mining = 1
 ProfessionLootParty.MiningLootMultiplier = 1
 ProfessionLootParty.MiningSkillMultiplier = 1
-```
 
-### Herbalism
-
-```ini
 ProfessionLootParty.Herbalism = 1
 ProfessionLootParty.HerbalismLootMultiplier = 1
 ProfessionLootParty.HerbalismSkillMultiplier = 1
-```
 
-### Skinning
-
-```ini
 ProfessionLootParty.Skinning = 1
 ProfessionLootParty.SkinningLootMultiplier = 1
 ProfessionLootParty.SkinningSkillMultiplier = 1
 ```
 
-### Group eligibility
+Multipliers are clamped to `1 – 100`.
+
+### Eligibility
 
 ```ini
-ProfessionLootParty.Distance = 100
+ProfessionLootParty.Distance = 100          ; 0 - 250
 ProfessionLootParty.Raid = 1
 ProfessionLootParty.RequireSkill = 1
+ProfessionLootParty.RequireNodeSkill = 1
+ProfessionLootParty.RequireGroup = 1
+ProfessionLootParty.ApplyToGatherer = 1
+ProfessionLootParty.MaxRecipients = 0       ; 0 = unlimited
 ```
 
-### Debugging
+`RequireGroup = 0` also applies the multipliers to solo gatherers, which turns
+the module into a personal gathering multiplier as well.
+
+`ApplyToGatherer = 0` leaves the gatherer's own result untouched and only
+rewards the rest of the group.
+
+### Performance
 
 ```ini
+ProfessionLootParty.SearchDistance = 10     ; 1 - 100
+ProfessionLootParty.AutoGatherCompat = 1
+```
+
+`SearchDistance` is the radius used to locate the node or corpse the gatherer
+just used — not the group distance. A gatherer always stands next to the
+resource, so a small value is correct. The search cost grows with the square of
+this radius and it runs on every gathering skill-up on the server, so leave it
+low unless a gathering module moves the player away before the skill-up hook
+fires.
+
+If you do not run `mod-auto-gather`, set `AutoGatherCompat = 0` to remove the
+fallback search entirely.
+
+### Feedback
+
+```ini
+ProfessionLootParty.Announce = 0
 ProfessionLootParty.Debug = 0
 ```
 
-Set to `1` for diagnostic logging.
-
 ## Backwards compatibility
-
-The old:
 
 ```ini
 ProfessionLootParty.MiningMultiplier
@@ -333,117 +212,89 @@ ProfessionLootParty.HerbalismMultiplier
 ProfessionLootParty.SkinningMultiplier
 ```
 
-settings are accepted as deprecated fallbacks for the **loot multiplier**.
-
-The new configuration should use:
-
-```ini
-ProfessionLootParty.MiningLootMultiplier
-ProfessionLootParty.MiningSkillMultiplier
-
-ProfessionLootParty.HerbalismLootMultiplier
-ProfessionLootParty.HerbalismSkillMultiplier
-
-ProfessionLootParty.SkinningLootMultiplier
-ProfessionLootParty.SkinningSkillMultiplier
-```
-
-The old settings do not control skill-up attempts.
+These are still read as deprecated fallbacks for the corresponding
+**loot** multiplier. They never controlled skill-up attempts.
 
 ## Design
 
-The module intentionally leaves the original gathering implementation alone.
+The module leaves the original gathering implementation alone.
 
-For normal Mining/Herbalism:
+Normal Mining/Herbalism:
 
 ```text
 AzerothCore gathering
         |
         v
-GameObject loot state
-        |
-        v
-ProfessionLootParty detects operation
+GameObject loot state (filtered: gathering nodes only)
         |
         v
 OnPlayerUpdateGatheringSkill
         |
         +--> additional loot rolls
-        |
         +--> additional UpdateGatherSkill() attempts
 ```
 
-For `mod-auto-gather`:
+`mod-auto-gather`:
 
 ```text
-mod-auto-gather
+mod-auto-gather -> UpdateGatherSkill()
         |
         v
-UpdateGatherSkill()
-        |
-        v
-ProfessionLootParty detects matching node
+short-range node search (SearchDistance)
         |
         +--> additional loot rolls
-        |
         +--> additional UpdateGatherSkill() attempts
 ```
 
-For Skinning:
+Skinning:
 
 ```text
 Normal Skinning / AutoSkinCreature()
         |
         v
-LOOT_SKINNING corpse state
-        |
-        v
-UpdateGatherSkill(SKILL_SKINNING)
-        |
-        v
-ProfessionLootParty
+LOOT_SKINNING corpse state -> UpdateGatherSkill(SKILL_SKINNING)
         |
         +--> additional skinning loot rolls
-        |
         +--> additional UpdateGatherSkill() attempts
 ```
 
-The module therefore does not need to modify `SpellEffects.cpp`, `Player.cpp`, `GameObject.cpp`, or `mod-auto-gather`.
+No changes to `SpellEffects.cpp`, `Player.cpp`, `GameObject.cpp` or
+`mod-auto-gather` are required.
+
+### Re-entrancy
+
+`Player::UpdateGatherSkill()` fires `OnPlayerUpdateGatheringSkill` *before*
+performing the skill-up calculation. Because the module calls
+`UpdateGatherSkill()` itself to simulate additional attempts, a thread-local
+RAII guard suppresses the nested hook. Without it, a simulated attempt would be
+detected as a new gathering operation and distribute another round of loot.
+
+### Thread safety
+
+Map updates run on worker threads (`MapUpdate.Threads`). All state shared
+between players is guarded by a mutex; the re-entrancy guard is thread-local
+and lock free.
 
 ## Notes
 
-`LootMultiplier` and `SkillMultiplier` are intentionally independent.
-
-For example:
-
-```ini
-ProfessionLootParty.SkinningLootMultiplier = 5
-ProfessionLootParty.SkinningSkillMultiplier = 1
-```
-
-means:
-
-```text
-5 loot rolls
-1 normal skill-up attempt
-```
-
-while:
+`LootMultiplier` and `SkillMultiplier` are intentionally independent:
 
 ```ini
 ProfessionLootParty.SkinningLootMultiplier = 2
 ProfessionLootParty.SkinningSkillMultiplier = 4
 ```
 
-means:
+means two loot rolls and four skill-up *chances* — not four guaranteed skill
+points.
 
-```text
-2 loot rolls
-4 skill-up attempts
-```
+Ore, herbs and leather are the base of the crafting economy. On a populated
+realm a high multiplier is an economic decision, not only a convenience
+setting.
 
-The latter does not force four skill points. It gives four chances through AzerothCore's normal `UpdateGatherSkill()` mechanism.
+See [CHANGELOG.md](CHANGELOG.md) for the full list of fixes and behaviour
+changes.
 
 ## License
 
-This module follows the licensing terms of the project repository and its AzerothCore integration.
+This module follows the licensing terms of the project repository and its
+AzerothCore integration.

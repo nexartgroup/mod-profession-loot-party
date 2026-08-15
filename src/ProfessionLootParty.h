@@ -6,7 +6,7 @@
  * Group profession loot with independent loot rolls and
  * independent profession skill-up attempts.
  *
- * Supported:
+ * Supported professions:
  *   - Mining
  *   - Herbalism
  *   - Skinning
@@ -37,8 +37,8 @@
  *   - nothing
  */
 
-#ifndef PROFESSION_LOOT_PARTY_H
-#define PROFESSION_LOOT_PARTY_H
+#ifndef MOD_PROFESSION_LOOT_PARTY_H
+#define MOD_PROFESSION_LOOT_PARTY_H
 
 #include "AllGameObjectScript.h"
 #include "Define.h"
@@ -53,65 +53,90 @@ class Unit;
 
 namespace ProfessionLootParty
 {
-    struct PendingGather
+    /*
+     * Internal profession slots.
+     *
+     * Used to index the settings array instead of repeating a
+     * switch over the DBC skill ids in every accessor.
+     */
+    enum ProfessionSlot : uint8
     {
-        ObjectGuid gatherer;
-        ObjectGuid gameObject;
-        uint32 createdAt = 0;
+        PROFESSION_MINING    = 0,
+        PROFESSION_HERBALISM = 1,
+        PROFESSION_SKINNING  = 2,
+        PROFESSION_MAX
     };
 
-    struct RecentSkinning
+    struct ProfessionSettings
     {
-        ObjectGuid gatherer;
-        ObjectGuid creature;
-        uint32 createdAt = 0;
+        bool   Enabled         = true;
+        uint32 LootMultiplier  = 1;
+        uint32 SkillMultiplier = 1;
     };
+
+    struct ModuleSettings
+    {
+        bool  Enabled          = true;
+
+        ProfessionSettings Professions[PROFESSION_MAX];
+
+        /* Maximum distance between the resource and a receiving member. */
+        float MaxDistance      = 100.0f;
+
+        /* Radius used to locate the node/corpse the gatherer just used. */
+        float SearchDistance   = 10.0f;
+
+        bool  IncludeRaid      = true;
+        bool  RequireSkill     = true;
+        bool  RequireNodeSkill = true;
+        bool  RequireGroup     = true;
+        bool  ApplyToGatherer  = true;
+        bool  AutoGatherCompat = true;
+        bool  Announce         = false;
+        bool  Debug            = false;
+
+        /* 0 = unlimited. */
+        uint32 MaxRecipients   = 0;
+    };
+
+    /* --------------------------------------------------------------
+     * Public query API (stable, usable by other modules)
+     * -------------------------------------------------------------- */
 
     bool IsEnabled();
-
     bool IsProfessionEnabled(uint32 skillId);
-
     uint32 GetProfessionLootMultiplier(uint32 skillId);
-
     uint32 GetProfessionSkillMultiplier(uint32 skillId);
 
-    void AddPendingGather(
-        Player* gatherer,
-        GameObject* gameObject);
+    ModuleSettings const& GetSettings();
 
-    void RemovePendingGather(
-        ObjectGuid playerGuid);
+    /* --------------------------------------------------------------
+     * Internal pipeline (kept public for backwards compatibility)
+     * -------------------------------------------------------------- */
 
-    bool ProcessPendingGather(
-        Player* gatherer,
-        uint32 skillId);
+    void AddPendingGather(Player* gatherer, GameObject* gameObject);
+    void RemovePendingGather(ObjectGuid playerGuid);
 
-    void ProcessAutoGather(
-        Player* gatherer,
-        uint32 skillId);
+    bool ProcessPendingGather(Player* gatherer, uint32 skillId);
+    void ProcessAutoGather(Player* gatherer, uint32 skillId);
+    bool ProcessSkinning(Player* skinner);
 
-    bool ProcessSkinning(
-        Player* skinner);
+    void RemoveRecentSkinning(ObjectGuid playerGuid);
+    void ForgetPlayer(ObjectGuid playerGuid);
 
-    void RemoveRecentSkinning(
-        ObjectGuid playerGuid);
+    /* --------------------------------------------------------------
+     * Scripts
+     * -------------------------------------------------------------- */
 
     class PlayerScript final : public ::PlayerScript
     {
     public:
         PlayerScript();
 
-        void OnPlayerUpdateGatheringSkill(
-            Player* player,
-            uint32 skillId,
-            uint32 currentLevel,
-            uint32 gray,
-            uint32 green,
-            uint32 yellow,
-            uint32& gain) override;
+        void OnPlayerUpdateGatheringSkill(Player* player, uint32 skillId, uint32 currentLevel,
+            uint32 gray, uint32 green, uint32 yellow, uint32& gain) override;
 
-        void OnPlayerLogout(
-            Player* player) override;
+        void OnPlayerLogout(Player* player) override;
     };
 
     class GameObjectScript final : public ::AllGameObjectScript
@@ -119,10 +144,7 @@ namespace ProfessionLootParty
     public:
         GameObjectScript();
 
-        void OnGameObjectLootStateChanged(
-            GameObject* gameObject,
-            uint32 state,
-            Unit* unit) override;
+        void OnGameObjectLootStateChanged(GameObject* gameObject, uint32 state, Unit* unit) override;
     };
 
     class ConfigScript final : public ::WorldScript
@@ -130,8 +152,8 @@ namespace ProfessionLootParty
     public:
         ConfigScript();
 
-        void OnBeforeConfigLoad(
-            bool reload) override;
+        void OnBeforeConfigLoad(bool reload) override;
+        void OnAfterConfigLoad(bool reload) override;
     };
 }
 
@@ -142,4 +164,4 @@ namespace ProfessionLootParty
  */
 void Addmod_profession_loot_partyScripts();
 
-#endif
+#endif // MOD_PROFESSION_LOOT_PARTY_H
